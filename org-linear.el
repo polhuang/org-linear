@@ -129,6 +129,8 @@ Returns parsed JSON as an alist, or signals an error."
         (error "Linear GraphQL error: %s" message)))
     (alist-get 'data resp)))
 
+;;;; Teams
+
 (defun linear--teams ()
   "Return a list of teams as ((display . id) ...)."
   (let* ((q "query { teams(first: 100) { nodes { id name key } } }")
@@ -140,6 +142,159 @@ Returns parsed JSON as an alist, or signals an error."
                     (key (alist-get 'key node)))
                 (cons (format "%s (%s)" name key) id)))
             (append nodes nil))))
+
+
+;;;; Issues -> Org
+
+(defun linear--string-or (s fallback)
+  "Trim S to a string, else FALLBACK."
+  (let ((v (and s (stringp s) (string-trim s))))
+    (if (and v (> (length v) 0)) v fallback)))
+
+(defun linear--issues-for-team (team-id)
+  "Return a list of issue nodes for TEAM-ID (handles pagination)."
+  (let ((query
+         "query($teamId: String!, $first: Int!, $after: String) {
+            issues(
+              filter: { team: { id: { eq: $teamId } }, state: { type: { neq: \"canceled\" } } }
+              orderBy: updatedAt
+              first: $first
+              after: $after
+            ) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id identifier title url
+                state { id name type }
+                priority
+                assignee { id name displayName }
+                createdAt updatedAt
+              }
+            }
+          }"))
+    (let (results after has-next)
+      (setq has-next t)
+      (while has-next
+        (let* ((vars (let ((ht (make-hash-table :test 'equal)))
+                       (puthash "teamId" team-id ht)
+                       (puthash "first" (or linear-issues-page-size 50) ht)
+                       (when after (puthash "after" after ht))
+                       ht))
+               (data (linear--graphql query vars))
+               (issues (linear--alist-get-in '(issues nodes) data))
+               (page   (linear--alist-get-in '(issues pageInfo) data)))
+          (setq results (nconc results (append issues nil)))
+          (setq has-next (alist-get 'hasNextPage page))
+          (setq after    (alist-get 'endCursor page))))
+      results)))
+
+(defun linear--issue->org-heading (issue)
+  "Return (HEADLINE . PROPERTIES) derived from ISSUE node."
+  (let* ((id          (alist-get 'id issue))
+         (identifier  (alist-get 'identifier issue))
+         (title       (linear--string-or (alist-get 'title issue) "(no title)"))
+         (url         (alist-get 'url issue))
+         (state-name  (linear--alist-get-in '(state name) issue))
+         (assignee    (or (linear--alist-get-in '(assignee displayName) issue)
+                          (linear--alist-get-in '(assignee name) issue)
+                          "—"))
+         (priority    (alist-get 'priority issue))
+         (headline    (format "[%s] %s" identifier title))
+         (props `(("LINEAR_ID"  . ,id)
+                  ("STATE"      . ,(or state-name ""))
+                  ("ASSIGNEE"   . ,assignee)
+                  ("PRIORITY"   . ,(if priority (number-to-string priority) ""))
+                  ("URL"        . ,(or url "")) )))
+    (cons headline props)))
+
+(defun linear--insert-org-heading (headline props)
+  "Insert an Org subtree for HEADLINE with PROPS alist."
+  (insert (format "** %s :linear:\n" headline))
+  (insert ":PROPERTIES:\n")
+  (dolist (kv props)
+    (insert (format ":%s: %s\n" (car kv) (cdr kv))))
+  (insert ":END:\n"))
+
+
+;;;###autoload
+(defun linear-org-insert-issues-for-team (&optional team-id)
+  "Prompt for a Linear TEAM-ID (or use TEAM-ID) and insert its open issues as Org headings.
+Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
+  (interactive)
+  (linear--assert-auth)
+  (let* ((choice (or team-id
+                     (let* ((pairs (linear--teams))
+                            (name (completing-read "Linear team: " (mapcar #'car pairs) nil t)))
+                       (cdr (assoc name pairs)))))
+         (issues (linear--issues-for-team choice))
+         (team-label (car (rassoc choice (linear--teams)))))
+    (unless issues
+      (user-error "No issues returned for that team"))
+    (save-excursion
+      ;; Insert a parent heading; user can move it as desired.
+      (unless (org-before-first-heading-p)
+        (org-back-to-heading t)
+        (org-end-of-subtree t t)
+        (unless (bolp) (insert "\n")))
+      (insert (format "* Linear Issues for %s (synced %s)\n"
+                      (or team-label choice)
+                      (format-time-string "%Y-%m-%d %H:%M")))
+      ;; Store TEAM_ID so refresh can work later.
+      (org-set-property "TEAM_ID" choice)
+      (dolist (iss issues)
+        (pcase-let* ((`(,headline . ,props) (linear--issue->org-heading iss)))
+          (linear--insert-org-heading headline props)))
+      (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
+
+;;;###autoload
+(defun linear-org-open-at-point ()
+  "Open the Linear issue URL for the Org heading at point."
+  (interactive)
+  (let ((url (org-entry-get (point) "URL")))
+    (if (and url (string-match-p "^https?://" url))
+        (browse-url url)
+      (user-error "No URL property on this heading"))))
+
+;;;###autoload
+(defun linear-org-refresh-under-heading ()
+  "Re-sync issues for the team of the current parent heading, replacing `**` entries.
+Relies on a TEAM_ID property at the parent level."
+  (interactive)
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((parent (point))
+           (team-id (org-entry-get parent "TEAM_ID")))
+      (unless team-id
+        (user-error "No TEAM_ID on this heading; re-run `linear-org-insert-issues-for-team`"))
+      ;; Remove existing level-2 children beneath this parent:
+      (org-map-entries
+       (lambda ()
+         (when (= (org-current-level) 2)
+           (org-cut-subtree)))
+       nil 'children)
+      ;; Reinsert fresh data:
+      (let ((issues (linear--issues-for-team team-id)))
+        (dolist (iss issues)
+          (pcase-let* ((`(,headline . ,props) (linear--issue->org-heading iss)))
+            (linear--insert-org-heading headline props)))
+        (message "Refreshed %d issues" (length issues))))))
+
+;;;; Minor mode & keymap
+
+(defvar linear-org-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c l i") #'linear-org-insert-issues-for-team)
+    (define-key m (kbd "C-c l o") #'linear-org-open-at-point)
+    (define-key m (kbd "C-c l r") #'linear-org-refresh-under-heading)
+    m)
+  "Keymap for `linear-org-mode`.")
+
+;;;###autoload
+(define-minor-mode linear-org-mode
+  "Minor mode with keybindings for Linear ↔ Org workflows."
+  :init-value nil
+  :lighter " LinearOrg"
+  :keymap linear-org-mode-map)
+
 
 (provide 'linear-org)
 ;;; linear-org.el ends here
