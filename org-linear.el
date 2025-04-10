@@ -12,7 +12,7 @@
 ;;
 ;; Quick start:
 ;;   (require 'linear-org)
-;;   M-x linear-oauth-callback-server     ;; http://localhost:8080/linear-callback
+;;   M-x linear-oauth-callback-server     ;; http://localhost:8080/callback
 ;;   M-x linear-oauth-authorize
 ;;   M-x linear-org-insert-issues-for-team
 ;;   (Optional) Turn on minor mode in Org buffers for keybindings:
@@ -58,7 +58,7 @@
   :type 'string
   :group 'linear-org)
 
-(defcustom linear-oauth-redirect-uri "http://localhost:8080/linear-callback"
+(defcustom linear-oauth-redirect-uri "http://localhost:8080/callback"
   "Redirect URI for Linear OAuth2 authentication (must match app settings)."
   :type 'string
   :group 'linear-org)
@@ -73,8 +73,8 @@
 
 ;;;; OAuth: top-level servlet + helpers
 
-;; Handler at: http://localhost:8080/linear-callback
-(defservlet linear-callback text/plain (path query)
+;; Handler at: http://localhost:8080/callback
+(defservlet callback text/plain (path query)
   (let ((code  (cadr (assoc "code" query)))
         (state (cadr (assoc "state" query))))
     (cond
@@ -88,11 +88,11 @@
 
 ;;;###autoload
 (defun linear-oauth-callback-server ()
-  "Start a local HTTP server for Linear OAuth at /linear-callback."
+  "Start a local HTTP server for Linear OAuth at /callback."
   (interactive)
   (setq httpd-port 8080)
   (httpd-start)
-  (message "Listening for Linear OAuth callback at http://localhost:%d/linear-callback" httpd-port))
+  (message "Listening for Linear OAuth callback at http://localhost:%d/callback" httpd-port))
 
 ;;;###autoload
 (defun linear-oauth-callback-server-stop ()
@@ -165,9 +165,9 @@
 
 (defun linear--graphql (query &optional variables)
   "Execute a synchronous GraphQL REQUEST with QUERY and VARIABLES.
-Returns parsed JSON as an alist, or signals an error."
+Returns parsed JSON as an alist, or signals an error with details."
   (linear--assert-auth)
-  (let (resp err)
+  (let (resp err resp-buf)
     (request
      linear-graphql-endpoint
      :type "POST"
@@ -178,9 +178,13 @@ Returns parsed JSON as an alist, or signals an error."
                           ("variables" . ,(or variables (make-hash-table :test 'equal)))))
      :parser 'json-read
      :success (cl-function (lambda (&key data &allow-other-keys) (setq resp data)))
-     :error   (cl-function (lambda (&key error-thrown &allow-other-keys) (setq err error-thrown))))
+     :error   (cl-function
+               (lambda (&key error-thrown response &allow-other-keys)
+                 (setq err error-thrown
+                       resp-buf (and response (request-response-buffer response))))))
     (when err
-      (error "Linear GraphQL request failed: %S" err))
+      (let ((raw (and resp-buf (with-current-buffer resp-buf (buffer-string)))))
+        (error "Linear GraphQL request failed: %S\nRaw: %s" err (or raw ""))))
     (let* ((errors (alist-get 'errors resp))
            (first-error (and (vectorp errors) (> (length errors) 0) (aref errors 0)))
            (msg (and (consp first-error) (alist-get 'message first-error))))
@@ -215,12 +219,7 @@ Returns parsed JSON as an alist, or signals an error."
 
 (defun linear--team-states (team-id)
   "Return ((DISPLAY . ID) ...) for workflow states of TEAM-ID."
-  ;; NB: team(id: …) expects String!, not ID!
-  (let* ((q "query($id: String!) {
-               team(id:$id){
-                 states(first:100){ nodes { id name type } }
-               }
-             }")
+  (let* ((q "query($id: ID!) { team(id:$id){ states(first:100){ nodes { id name type } } } }")
          (vars (let ((h (make-hash-table :test 'equal))) (puthash "id" team-id h) h))
          (data (linear--graphql q vars))
          (nodes (linear--alist-get-in '(team states nodes) data)))
@@ -314,11 +313,11 @@ Returns parsed JSON as an alist, or signals an error."
                           "—"))
          (priority    (alist-get 'priority issue))
          (headline    (format "[%s] %s" identifier title))
-         (props `(("LINEAR_ID"    . ,id)
-                  ("STATE"        . ,(or state-name ""))
-                  ("ASSIGNEE"     . ,assignee)
-                  ("LNR_PRIORITY" . ,(if priority (number-to-string priority) ""))
-                  ("URL"          . ,(or url "")) )))
+         (props `(("LINEAR_ID"  . ,id)
+                  ("STATE"      . ,(or state-name ""))
+                  ("ASSIGNEE"   . ,assignee)
+                  ("PRIORITY"   . ,(if priority (number-to-string priority) ""))
+                  ("URL"        . ,(or url "")) )))
     (cons headline props)))
 
 (defun linear--insert-org-heading (headline props)
@@ -444,24 +443,6 @@ Relies on a TEAM_ID property at the parent level."
       ((pred (string-prefix-p "4")) 4)
       (_ nil))))
 
-;; Safe helper: only remove the Org priority cookie if one exists
-(defun linear--org-heading-has-priority-p ()
-  "Return non-nil if the current heading already has an Org priority cookie."
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((h (org-get-heading t t t t)))
-      (string-match-p "\\[#[A-Z]\\]" h))))
-
-(defun linear--apply-org-priority-from-linear (lin-prio)
-  "Map Linear priority 0..4 to Org priority cookie A..C (or clear if present)."
-  (when (org-at-heading-p)
-    (pcase lin-prio
-      ((or 4 3) (org-priority ?A))
-      (2        (org-priority ?B))
-      (1        (org-priority ?C))
-      (_        (when (linear--org-heading-has-priority-p)
-                  (org-priority 'remove))))))
-
 (defun linear--issue-create (team-id title description &optional assignee-id state-id priority)
   "Create a Linear issue; return alist with id/identifier/url (or signal error)."
   (let* ((q "mutation($input: IssueCreateInput!){
@@ -492,7 +473,7 @@ Relies on a TEAM_ID property at the parent level."
 (defun linear-org-create-issue-from-subtree (&optional team-id)
   "Create a Linear issue using the current Org subtree.
 Prompts for Team/State/Assignee/Priority, uses heading as title and body as description.
-Writes LINEAR_ID/URL/STATE/ASSIGNEE/LNR_PRIORITY back to PROPERTIES and prefixes heading with [KEY-###]."
+Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes heading with [KEY-###]."
   (interactive)
   (linear--assert-auth)
   (save-excursion
@@ -521,16 +502,14 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/LNR_PRIORITY back to PROPERTIES and prefixes
                            "—"))
            (priority   (alist-get 'priority issue)))
       ;; Update PROPERTIES
-      (org-set-property "LINEAR_ID"    (alist-get 'id issue))
-      (org-set-property "URL"          (or url ""))
-      (org-set-property "STATE"        (or state-name ""))
-      (org-set-property "ASSIGNEE"     assignee)
-      (org-set-property "LNR_PRIORITY" (if priority (number-to-string priority) ""))
-      ;; Optional: set Org A..C cookie based on Linear priority (safe remove)
-      (linear--apply-org-priority-from-linear priority)
+      (org-set-property "LINEAR_ID" (alist-get 'id issue))
+      (org-set-property "URL"       (or url ""))
+      (org-set-property "STATE"     (or state-name ""))
+      (org-set-property "ASSIGNEE"  assignee)
+      (org-set-property "PRIORITY"  (if priority (number-to-string priority) ""))
       ;; Update heading to include identifier prefix
       (let* ((current (org-get-heading t t t t))
-             (new     (if (string-match-p "^\\[[^]]+] " current)
+             (new     (if (string-match-p (rx bol "[" (+ (not ?])) "] ") current)
                           current
                         (format "[%s] %s" identifier current))))
         (org-edit-headline new))
