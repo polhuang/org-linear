@@ -1,22 +1,21 @@
-;;; linear-org.el --- Org-mode integration for Linear.app  -*- lexical-binding: t; -*-
+;;; org-linear.el --- Org-mode integration for Linear.app  -*- lexical-binding: t; -*-
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 ;; End-to-end Linear ↔ Org workflow:
 ;; - OAuth (authorize, local callback, token exchange)
-;; - GraphQL helper (error details, sane encoding)
 ;; - Insert team issues into Org as headings
 ;; - Open issue URL from heading
 ;; - Refresh issues under a parent heading
 ;; - Create a Linear issue from current Org subtree (writes PROPERTIES, renames heading)
 ;;
 ;; Quick start:
-;;   (require 'linear-org)
-;;   M-x linear-oauth-callback-server     ;; http://localhost:8080/callback
-;;   M-x linear-oauth-authorize
-;;   M-x linear-org-insert-issues-for-team
+;;   (require 'org-linear)
+;;   M-x org-linear-oauth-callback-server     ;; http://localhost:8080/callback
+;;   M-x org-linear-oauth-authorize
+;;   M-x org-linear-insert-issues-for-team
 ;;   (Optional) Turn on minor mode in Org buffers for keybindings:
-;;     (add-hook 'org-mode-hook #'linear-org-mode)
+;;     (add-hook 'org-mode-hook #'org-linear-mode)
 
 ;;; Code:
 
@@ -26,68 +25,254 @@
 (require 'cl-lib)        ;; cl-function, cl-reduce
 (require 'subr-x)        ;; string-empty-p, string-trim
 (require 'simple-httpd)  ;; defservlet / httpd-start
+(require 'auth-source)   ;; secure authentication
 
-(defgroup linear-org nil
+(defgroup org-linear nil
   "Integration with Linear."
   :group 'tools)
 
+(defgroup org-linear-auth nil
+  "Authentication settings for Linear integration."
+  :group 'org-linear)
+
 ;;;; Configuration
 
-(defcustom linear-graphql-endpoint "https://api.linear.app/graphql"
+(defcustom org-linear-graphql-endpoint "https://api.linear.app/graphql"
   "Linear GraphQL endpoint."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-api-key ""
+(defcustom org-linear-api-key ""
   "API key (OAuth access token) for accessing the Linear API."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-workspace-id ""
+(defcustom org-linear-workspace-id ""
   "Workspace ID for Linear (not required for authenticated queries)."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-client-id "195109b12876be343bad55f93cb30172"
+(defcustom org-linear-client-id "195109b12876be343bad55f93cb30172"
   "Client ID for Linear OAuth2 application."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-client-secret "d3ee010b6a76ff78a1e1cacaeb352356"
+(defcustom org-linear-client-secret "d3ee010b6a76ff78a1e1cacaeb352356"
   "Client secret for Linear OAuth2 application."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-oauth-redirect-uri "http://localhost:8080/callback"
+(defcustom org-linear-oauth-redirect-uri "http://localhost:8080/callback"
   "Redirect URI for Linear OAuth2 authentication (must match app settings)."
   :type 'string
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defcustom linear-issues-page-size 50
+(defcustom org-linear-issues-page-size 50
   "How many issues to fetch per GraphQL page."
   :type 'integer
-  :group 'linear-org)
+  :group 'org-linear)
 
-(defvar linear-oauth-state nil
+(defvar org-linear-oauth-state nil
   "CSRF-prevention state used during OAuth flow.")
+
+(defvar org-linear-oauth-pkce-verifier nil
+  "PKCE code verifier for OAuth flow.")
+
+;;;; Authentication helpers
+
+(defcustom org-linear-auth-host "api.linear.app"
+  "Host for Linear API authentication storage."
+  :type 'string
+  :group 'org-linear-auth)
+
+(defcustom org-linear-auth-user "token"
+  "User identifier for Linear token storage."
+  :type 'string
+  :group 'org-linear-auth)
+
+(defvar org-linear--cached-token nil
+  "Cached access token to avoid repeated auth-source lookups.")
+
+(defvar org-linear--token-expiry nil
+  "Timestamp when cached token expires.")
+
+(defun org-linear-auth--read-token ()
+  "Read Linear access token from auth-source with caching.
+Returns token string or nil if not found."
+  ;; Return cached token if still valid
+  (when (and org-linear--cached-token 
+             org-linear--token-expiry
+             (time-less-p (current-time) org-linear--token-expiry))
+    (return org-linear--cached-token))
+  
+  ;; Look up token from auth-source
+  (when-let* ((auth-info (auth-source-search
+                         :host org-linear-auth-host
+                         :user org-linear-auth-user
+                         :port "https"
+                         :require '(:secret)
+                         :max 1))
+              (auth-entry (car auth-info))
+              (secret-fn (plist-get auth-entry :secret)))
+    (let ((token (if (functionp secret-fn) (funcall secret-fn) secret-fn)))
+      (when (and token (stringp token) (> (length (string-trim token)) 0))
+        (setq org-linear--cached-token token
+              org-linear--token-expiry (time-add (current-time) (* 3600 24))) ; Cache for 24h
+        token))))
+
+(defun org-linear-auth--write-token (token &optional refresh-token expires-in)
+  "Write TOKEN to auth-source storage.
+REFRESH-TOKEN and EXPIRES-IN are stored for future use."
+  (when (and token (stringp token) (> (length (string-trim token)) 0))
+    (let ((auth-source-save-behavior t))
+      ;; Store access token
+      (auth-source-store-save
+       :host org-linear-auth-host
+       :user org-linear-auth-user
+       :port "https"
+       :secret token)
+      
+      ;; Store refresh token if provided
+      (when (and refresh-token (stringp refresh-token) (> (length (string-trim refresh-token)) 0))
+        (auth-source-store-save
+         :host org-linear-auth-host
+         :user (concat org-linear-auth-user "-refresh")
+         :port "https"
+         :secret refresh-token))
+      
+      ;; Cache the token
+      (setq org-linear--cached-token token
+            org-linear--token-expiry (if expires-in
+                                    (time-add (current-time) expires-in)
+                                  (time-add (current-time) (* 3600 24)))))))
+
+(defun org-linear-auth-clear ()
+  "Clear stored Linear authentication tokens."
+  (interactive)
+  (setq org-linear--cached-token nil
+        org-linear--token-expiry nil)
+  (let ((deleted 0))
+    ;; Clear access token
+    (when-let ((auth-info (auth-source-search
+                          :host org-linear-auth-host
+                          :user org-linear-auth-user
+                          :port "https"
+                          :max 1)))
+      (dolist (entry auth-info)
+        (when-let ((delete-fn (plist-get entry :delete)))
+          (funcall delete-fn)
+          (cl-incf deleted))))
+    
+    ;; Clear refresh token
+    (when-let ((auth-info (auth-source-search
+                          :host org-linear-auth-host
+                          :user (concat org-linear-auth-user "-refresh")
+                          :port "https"
+                          :max 1)))
+      (dolist (entry auth-info)
+        (when-let ((delete-fn (plist-get entry :delete)))
+          (funcall delete-fn)
+          (cl-incf deleted))))
+    
+    (message "Cleared %d Linear auth token(s)" deleted)))
+
+(defun org-linear-auth--read-client-credentials ()
+  "Read client credentials from environment or auth-source.
+Returns (client-id . client-secret) or signals error."
+  (let ((id (or (getenv "LINEAR_CLIENT_ID")
+                ;; Fallback to deprecated defcustom for backward compatibility
+                (unless (string-empty-p (string-trim org-linear-client-id))
+                  org-linear-client-id)
+                (when-let* ((auth-info (auth-source-search
+                                       :host org-linear-auth-host
+                                       :user "client-id"
+                                       :port "https"
+                                       :max 1))
+                            (secret-fn (plist-get (car auth-info) :secret)))
+                  (if (functionp secret-fn) (funcall secret-fn) secret-fn))))
+        (secret (or (getenv "LINEAR_CLIENT_SECRET")
+                    ;; Fallback to deprecated defcustom for backward compatibility
+                    (unless (string-empty-p (string-trim org-linear-client-secret))
+                      org-linear-client-secret)
+                    (when-let* ((auth-info (auth-source-search
+                                           :host org-linear-auth-host
+                                           :user "client-secret"
+                                           :port "https"
+                                           :max 1))
+                                (secret-fn (plist-get (car auth-info) :secret)))
+                      (if (functionp secret-fn) (funcall secret-fn) secret-fn)))))
+    (unless (and id secret 
+                 (> (length (string-trim id)) 0) 
+                 (> (length (string-trim secret)) 0))
+      (user-error "Linear client credentials not found. Set LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET environment variables, configure via auth-source, or set org-linear-client-id/org-linear-client-secret (deprecated)"))
+    (cons (string-trim id) (string-trim secret))))
+
+(defun org-linear-auth--base64url-encode (data)
+  "Encode DATA as base64url (RFC 4648)."
+  (let ((b64 (base64-encode-string data t)))
+    (setq b64 (replace-regexp-in-string "\\+" "-" b64))
+    (setq b64 (replace-regexp-in-string "/" "_" b64))
+    (setq b64 (replace-regexp-in-string "=" "" b64))
+    b64))
+
+(defun org-linear-auth--generate-pkce-pair ()
+  "Generate PKCE code verifier and challenge."
+  (let* ((verifier-data (format "%s-%s-%s-%s" 
+                               (current-time-string)
+                               (emacs-pid)
+                               (random 1000000)
+                               (random 1000000)))
+         (verifier (org-linear-auth--base64url-encode verifier-data))
+         (challenge-data (secure-hash 'sha256 verifier nil nil 'binary))
+         (challenge (org-linear-auth--base64url-encode challenge-data)))
+    (cons verifier challenge)))
+
+(defun org-linear-auth--generate-state ()
+  "Generate cryptographically secure OAuth state parameter."
+  (let ((state-data (format "%s-%s-%s-%s"
+                           (current-time-string)
+                           (emacs-pid)
+                           (random 1000000)
+                           (random 1000000))))
+    (org-linear-auth--base64url-encode state-data)))
+
+(defun org-linear-auth-status ()
+  "Show current authentication status."
+  (interactive)
+  (let ((has-token (or (org-linear-auth--read-token)
+                       (unless (string-empty-p (string-trim org-linear-api-key))
+                         org-linear-api-key)))
+        (has-credentials (condition-case nil
+                            (org-linear-auth--read-client-credentials)
+                          (error nil))))
+    (message "Linear auth status: Token: %s, Credentials: %s"
+             (if has-token "✓" "✗")
+             (if has-credentials "✓" "✗"))))
 
 ;;;; OAuth: top-level servlet + helpers
 
 ;; Handler at: http://localhost:8080/callback
 (defservlet callback text/plain (path query)
   (let ((code  (cadr (assoc "code" query)))
-        (state (cadr (assoc "state" query))))
+        (state (cadr (assoc "state" query)))
+        (error-code (cadr (assoc "error" query))))
     (cond
+     (error-code
+      (insert (format "Authentication failed: %s" error-code)))
      ((not (and code state))
       (insert "Authentication failed: missing code/state."))
-     ((not (string= state linear-oauth-state))
-      (insert "Authentication failed: invalid state."))
+     ((not (string= state org-linear-oauth-state))
+      (insert "Authentication failed: invalid state (CSRF protection)."))
      (t
-      (linear-oauth-exchange-code code)
-      (insert "Authentication successful! You can close this window.")))))
+      (condition-case err
+          (progn
+            (org-linear-oauth-exchange-code code)
+            (insert "Authentication successful! You can close this window."))
+        (error
+         (insert (format "Authentication failed during token exchange: %s" (error-message-string err)))))))))
 
 ;;;###autoload
-(defun linear-oauth-callback-server ()
+(defun org-linear-oauth-callback-server ()
   "Start a local HTTP server for Linear OAuth at /callback."
   (interactive)
   (setq httpd-port 8080)
@@ -95,66 +280,90 @@
   (message "Listening for Linear OAuth callback at http://localhost:%d/callback" httpd-port))
 
 ;;;###autoload
-(defun linear-oauth-callback-server-stop ()
+(defun org-linear-oauth-callback-server-stop ()
   "Stop the local HTTP server used for Linear OAuth."
   (interactive)
   (httpd-stop)
   (message "Stopped OAuth callback server."))
 
 ;;;###autoload
-(defun linear-oauth-authorize ()
+(defun org-linear-oauth-authorize ()
   "Start the OAuth2 authorization process for Linear."
   (interactive)
-  (if (or (string-empty-p (string-trim (or linear-client-id "")))
-          (string-empty-p (string-trim (or linear-client-secret ""))))
-      (message "linear-client-id and linear-client-secret must be set")
-    (let* ((state (format "%06x" (random (expt 16 6))))
-           (url (format (concat "https://linear.app/oauth/authorize"
-                                "?client_id=%s"
-                                "&redirect_uri=%s"
-                                "&response_type=code"
-                                "&scope=read,write"
-                                "&state=%s")
-                        (url-hexify-string linear-client-id)
-                        (url-hexify-string linear-oauth-redirect-uri)
-                        (url-hexify-string state))))
-      (setq linear-oauth-state state)
-      (browse-url url)
-      (message "Opening browser for Linear OAuth… (Ensure callback server is running)"))))
+  (condition-case err
+      (pcase-let* ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials))
+                   (`(,verifier . ,challenge) (org-linear-auth--generate-pkce-pair))
+                   (state (org-linear-auth--generate-state))
+                   (url (format (concat "https://linear.app/oauth/authorize"
+                                        "?client_id=%s"
+                                        "&redirect_uri=%s"
+                                        "&response_type=code"
+                                        "&scope=read,write"
+                                        "&state=%s"
+                                        "&code_challenge=%s"
+                                        "&code_challenge_method=S256")
+                                (url-hexify-string client-id)
+                                (url-hexify-string org-linear-oauth-redirect-uri)
+                                (url-hexify-string state)
+                                (url-hexify-string challenge))))
+        (setq org-linear-oauth-state state
+              org-linear-oauth-pkce-verifier verifier)
+        (browse-url url)
+        (message "Opening browser for Linear OAuth… (Ensure callback server is running)"))
+    (error
+     (message "Failed to start OAuth flow: %s" (error-message-string err)))))
 
-(defun linear-oauth-exchange-code (code)
+(defun org-linear-oauth-exchange-code (code)
   "Exchange authorization CODE for an access token."
-  (request
-   "https://api.linear.app/oauth/token"
-   :type "POST"
-   :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
-   :data (format (concat "code=%s"
-                         "&redirect_uri=%s"
-                         "&client_id=%s"
-                         "&client_secret=%s"
-                         "&grant_type=authorization_code")
-                 (url-hexify-string code)
-                 (url-hexify-string linear-oauth-redirect-uri)
-                 (url-hexify-string linear-client-id)
-                 (url-hexify-string linear-client-secret))
-   :parser 'json-read
-   :success (cl-function
-             (lambda (&key data &allow-other-keys)
-               (let ((access-token (alist-get 'access_token data)))
-                 (setq linear-api-key (string-trim (or access-token "")))
-                 (message "Successfully authenticated with Linear!"))))
-   :error (cl-function
-           (lambda (&key error-thrown &allow-other-keys)
-             (message "Error exchanging code for token: %S" error-thrown)))))
+  (pcase-let ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials)))
+    (request
+     "https://api.linear.app/oauth/token"
+     :type "POST"
+     :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
+     :data (format (concat "code=%s"
+                          "&redirect_uri=%s"
+                          "&client_id=%s"
+                          "&client_secret=%s"
+                          "&grant_type=authorization_code"
+                          "&code_verifier=%s")
+                   (url-hexify-string code)
+                   (url-hexify-string org-linear-oauth-redirect-uri)
+                   (url-hexify-string client-id)
+                   (url-hexify-string client-secret)
+                   (url-hexify-string (or org-linear-oauth-pkce-verifier "")))
+     :parser 'json-read
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (let ((access-token (alist-get 'access_token data))
+                       (refresh-token (alist-get 'refresh_token data))
+                       (expires-in (alist-get 'expires_in data)))
+                   (org-linear-auth--write-token access-token refresh-token expires-in)
+                   (setq org-linear-oauth-state nil
+                         org-linear-oauth-pkce-verifier nil)
+                   (message "Successfully authenticated with Linear!"))))
+     :error (cl-function
+             (lambda (&key error-thrown response &allow-other-keys)
+               (let ((status (when response (request-response-status-code response)))
+                     (data (when response 
+                            (condition-case nil
+                                (with-current-buffer (request-response-buffer response)
+                                  (json-read-from-string (buffer-string)))
+                              (error nil)))))
+                 (message "Error exchanging code for token (HTTP %s): %S. Data: %S" 
+                         status error-thrown data)))))))
 
 ;;;; GraphQL core
 
-(defun linear--assert-auth ()
-  "Signal an error if no API key is present."
-  (when (string-empty-p (string-trim (or linear-api-key "")))
-    (user-error "No Linear API key found. Run `linear-oauth-authorize' or set `linear-api-key'")))
+(defun org-linear--assert-auth ()
+  "Signal an error if no API key is present, return token if found."
+  (let ((token (or (org-linear-auth--read-token)
+                   (unless (string-empty-p (string-trim org-linear-api-key))
+                     org-linear-api-key))))
+    (unless (and token (> (length (string-trim token)) 0))
+      (user-error "No Linear API key found. Run `linear-oauth-authorize' or configure via auth-source"))
+    token))
 
-(defun linear--alist-get-in (keys alist)
+(defun org-linear--alist-get-in (keys alist)
   "Return nested value by KEYS from ALIST/hash-tables."
   (cl-reduce (lambda (acc k)
                (cond
@@ -163,17 +372,17 @@
                 (t nil)))
              keys :initial-value alist))
 
-(defun linear--graphql (query &optional variables)
+(defun org-linear--graphql (query &optional variables)
   "Execute a synchronous GraphQL REQUEST with QUERY and VARIABLES.
 Returns parsed JSON as an alist, or signals an error with details."
-  (linear--assert-auth)
-  (let (resp err resp-buf)
+  (let ((token (org-linear--assert-auth))
+        resp err resp-buf)
     (request
-     linear-graphql-endpoint
+     org-linear-graphql-endpoint
      :type "POST"
      :sync t
      :headers `(("Content-Type" . "application/json")
-                ("Authorization" . ,(concat "Bearer " (string-trim linear-api-key))))
+                ("Authorization" . ,(concat "Bearer " (string-trim token))))
      :data (json-encode `(("query" . ,query)
                           ("variables" . ,(or variables (make-hash-table :test 'equal)))))
      :parser 'json-read
@@ -194,21 +403,21 @@ Returns parsed JSON as an alist, or signals an error with details."
 
 ;;;; Common helpers
 
-(defun linear--string-or (s fallback)
+(defun org-linear--string-or (s fallback)
   "Trim S to a string, else FALLBACK."
   (let ((v (and s (stringp s) (string-trim s))))
     (if (and v (> (length v) 0)) v fallback)))
 
-(defun linear--truthy (x)
+(defun org-linear--truthy (x)
   "Return non-nil iff JSON boolean X is true."
   (and x (not (eq x json-false))))
 
 ;;;; Teams
 
-(defun linear--teams ()
+(defun org-linear--teams ()
   "Return a list of teams as ((DISPLAY . ID) ...)."
   (let* ((q "query { teams(first: 100) { nodes { id name key } } }")
-         (data  (linear--graphql q))
+         (data  (org-linear--graphql q))
          (nodes (alist-get 'nodes (alist-get 'teams data))))
     (mapcar (lambda (node)
               (let ((id   (alist-get 'id node))
@@ -217,12 +426,12 @@ Returns parsed JSON as an alist, or signals an error with details."
                 (cons (format "%s (%s)" name key) id)))
             (append nodes nil))))
 
-(defun linear--team-states (team-id)
+(defun org-linear--team-states (team-id)
   "Return ((DISPLAY . ID) ...) for workflow states of TEAM-ID."
   (let* ((q "query($id: ID!) { team(id:$id){ states(first:100){ nodes { id name type } } } }")
          (vars (let ((h (make-hash-table :test 'equal))) (puthash "id" team-id h) h))
-         (data (linear--graphql q vars))
-         (nodes (linear--alist-get-in '(team states nodes) data)))
+         (data (org-linear--graphql q vars))
+         (nodes (org-linear--alist-get-in '(team states nodes) data)))
     (mapcar (lambda (node)
               (let ((id (alist-get 'id node))
                     (nm (alist-get 'name node))
@@ -232,7 +441,7 @@ Returns parsed JSON as an alist, or signals an error with details."
 
 ;;;; Workspace users (assignees)
 
-(defun linear--users (&optional n)
+(defun org-linear--users (&optional n)
   "Return ((DISPLAY . ID) ...) for workspace users (active first). N defaults to 200."
   (let* ((q "query($first:Int!){
                users(first:$first){
@@ -241,11 +450,11 @@ Returns parsed JSON as an alist, or signals an error with details."
              }")
          (vars (let ((h (make-hash-table :test 'equal)))
                  (puthash "first" (or n 200) h) h))
-         (data  (linear--graphql q vars))
+         (data  (org-linear--graphql q vars))
          (nodes (alist-get 'nodes (alist-get 'users data))))
     (let* ((vec (append nodes nil))
-           (active (seq-filter (lambda (u) (linear--truthy (alist-get 'active u))) vec))
-           (inactive (seq-remove (lambda (u) (linear--truthy (alist-get 'active u))) vec))
+           (active (seq-filter (lambda (u) (org-linear--truthy (alist-get 'active u))) vec))
+           (inactive (seq-remove (lambda (u) (org-linear--truthy (alist-get 'active u))) vec))
            (ordered (append active inactive)))
       (mapcar (lambda (u)
                 (let* ((id (alist-get 'id u))
@@ -257,7 +466,7 @@ Returns parsed JSON as an alist, or signals an error with details."
 
 ;;;; Issues → Org
 
-(defun linear--issues-for-team (team-id)
+(defun org-linear--issues-for-team (team-id)
   "Return a list of issue nodes for TEAM-ID (handles pagination)."
   (let ((query
          "query($teamId: ID!, $first: Int!, $after: String) {
@@ -286,30 +495,30 @@ Returns parsed JSON as an alist, or signals an error with details."
         (cl-incf guard)
         (let* ((vars (let ((ht (make-hash-table :test 'equal)))
                        (puthash "teamId" team-id ht)
-                       (puthash "first" (or linear-issues-page-size 50) ht)
+                       (puthash "first" (or org-linear-issues-page-size 50) ht)
                        (when after (puthash "after" after ht))
                        ht))
-               (data   (linear--graphql query vars))
+               (data   (org-linear--graphql query vars))
                (issues (alist-get 'issues data))
                (page   (alist-get 'pageInfo issues))
                (nodes  (alist-get 'nodes issues)))
           (setq results (nconc results (append nodes nil)))
           (setq prev-cursor after
                 after    (alist-get 'endCursor page)
-                has-next (linear--truthy (alist-get 'hasNextPage page)))
+                has-next (org-linear--truthy (alist-get 'hasNextPage page)))
           (when (and (not has-next) (equal after prev-cursor))
             (setq has-next nil))))
       results)))
 
-(defun linear--issue->org-heading (issue)
+(defun org-linear--issue->org-heading (issue)
   "Return (HEADLINE . PROPERTIES) derived from ISSUE node."
   (let* ((id          (alist-get 'id issue))
          (identifier  (alist-get 'identifier issue))
-         (title       (linear--string-or (alist-get 'title issue) "(no title)"))
+         (title       (org-linear--string-or (alist-get 'title issue) "(no title)"))
          (url         (alist-get 'url issue))
-         (state-name  (linear--alist-get-in '(state name) issue))
-         (assignee    (or (linear--alist-get-in '(assignee displayName) issue)
-                          (linear--alist-get-in '(assignee name) issue)
+         (state-name  (org-linear--alist-get-in '(state name) issue))
+         (assignee    (or (org-linear--alist-get-in '(assignee displayName) issue)
+                          (org-linear--alist-get-in '(assignee name) issue)
                           "—"))
          (priority    (alist-get 'priority issue))
          (headline    (format "[%s] %s" identifier title))
@@ -320,7 +529,7 @@ Returns parsed JSON as an alist, or signals an error with details."
                   ("URL"        . ,(or url "")) )))
     (cons headline props)))
 
-(defun linear--insert-org-heading (headline props)
+(defun org-linear--insert-org-heading (headline props)
   "Insert an Org subtree for HEADLINE with PROPS alist."
   (insert (format "** %s :linear:\n" headline))
   (insert ":PROPERTIES:\n")
@@ -329,17 +538,17 @@ Returns parsed JSON as an alist, or signals an error with details."
   (insert ":END:\n"))
 
 ;;;###autoload
-(defun linear-org-insert-issues-for-team (&optional team-id)
+(defun org-linear-insert-issues-for-team (&optional team-id)
   "Prompt for a Linear TEAM-ID (or use TEAM-ID) and insert its open issues as Org headings.
 Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
   (interactive)
-  (linear--assert-auth)
+  (org-linear--assert-auth)
   (let* ((choice (or team-id
-                     (let* ((pairs (linear--teams))
+                     (let* ((pairs (org-linear--teams))
                             (name (completing-read "Linear team: " (mapcar #'car pairs) nil t)))
                        (cdr (assoc name pairs)))))
-         (issues (linear--issues-for-team choice))
-         (team-label (car (rassoc choice (linear--teams)))))
+         (issues (org-linear--issues-for-team choice))
+         (team-label (car (rassoc choice (org-linear--teams)))))
     (unless issues
       (user-error "No issues returned for that team"))
     (save-excursion
@@ -352,12 +561,12 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
                       (format-time-string "%Y-%m-%d %H:%M")))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
-        (pcase-let* ((`(,headline . ,props) (linear--issue->org-heading iss)))
-          (linear--insert-org-heading headline props)))
+        (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading headline props)))
       (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
 
 ;;;###autoload
-(defun linear-org-open-at-point ()
+(defun org-linear-open-at-point ()
   "Open the Linear issue URL for the Org heading at point."
   (interactive)
   (let ((url (org-entry-get (point) "URL")))
@@ -366,7 +575,7 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
       (user-error "No URL property on this heading"))))
 
 ;;;###autoload
-(defun linear-org-refresh-under-heading ()
+(defun org-linear-refresh-under-heading ()
   "Re-sync issues for the team of the current parent heading, replacing `**` entries.
 Relies on a TEAM_ID property at the parent level."
   (interactive)
@@ -375,28 +584,28 @@ Relies on a TEAM_ID property at the parent level."
     (let* ((parent (point))
            (team-id (org-entry-get parent "TEAM_ID")))
       (unless team-id
-        (user-error "No TEAM_ID on this heading; re-run `linear-org-insert-issues-for-team`"))
+        (user-error "No TEAM_ID on this heading; re-run `org-linear-insert-issues-for-team`"))
       (org-map-entries
        (lambda ()
          (when (= (org-current-level) 2)
            (org-cut-subtree)))
        nil 'children)
-      (let ((issues (linear--issues-for-team team-id)))
+      (let ((issues (org-linear--issues-for-team team-id)))
         (dolist (iss issues)
-          (pcase-let* ((`(,headline . ,props) (linear--issue->org-heading iss)))
-            (linear--insert-org-heading headline props)))
+          (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
+            (org-linear--insert-org-heading headline props)))
         (message "Refreshed %d issues" (length issues))))))
 
 ;;;; Create issue from Org subtree
 
-(defun linear--org-subtree-title ()
+(defun org-linear--org-subtree-title ()
   "Return the current Org heading text, stripped of TODO/priority/tags."
   (save-excursion
     (org-back-to-heading t)
     (let ((raw (org-get-heading t t t t)))
       (string-trim raw))))
 
-(defun linear--org-subtree-body ()
+(defun org-linear--org-subtree-body ()
   "Return body text of the current Org subtree (excluding the heading line)."
   (save-excursion
     (org-back-to-heading t)
@@ -404,9 +613,9 @@ Relies on a TEAM_ID property at the parent level."
           (end (progn (org-end-of-subtree t t) (point))))
       (string-trim (buffer-substring-no-properties beg end)))))
 
-(defun linear--read-team (&optional default-id)
+(defun org-linear--read-team (&optional default-id)
   "Prompt for a team; if DEFAULT-ID provided, preselect it."
-  (let* ((pairs (linear--teams))
+  (let* ((pairs (org-linear--teams))
          (default-name (car (rassoc default-id pairs)))
          (name (completing-read
                 (if default-name
@@ -415,23 +624,23 @@ Relies on a TEAM_ID property at the parent level."
                 (mapcar #'car pairs) nil t nil nil default-name)))
     (cdr (assoc name pairs))))
 
-(defun linear--read-assignee (&optional _team-id)
+(defun org-linear--read-assignee (&optional _team-id)
   "Prompt for an assignee from workspace users; return user ID or nil."
-  (let* ((pairs (linear--users 200))
+  (let* ((pairs (org-linear--users 200))
          (names (cons "— Unassigned —" (mapcar #'car pairs)))
          (choice (completing-read "Assignee: " names nil t nil nil "— Unassigned —")))
     (if (string-prefix-p "—" choice) nil (cdr (assoc choice pairs)))))
 
-(defun linear--read-state (team-id)
+(defun org-linear--read-state (team-id)
   "Prompt for a workflow state in TEAM-ID; return state ID or nil."
-  (let* ((pairs (linear--team-states team-id))
+  (let* ((pairs (org-linear--team-states team-id))
          (names (cons "— Default —" (mapcar #'car pairs)))
          (choice (completing-read "State: " names nil t nil nil "— Default —")))
     (if (string-prefix-p "—" choice)
         nil
       (cdr (assoc choice pairs)))))
 
-(defun linear--read-priority ()
+(defun org-linear--read-priority ()
   "Prompt for priority 0–4; returns integer or nil."
   (let* ((opts '("0 (None)" "1 (Low)" "2 (Medium)" "3 (High)" "4 (Urgent)" "— leave unset —"))
          (choice (completing-read "Priority: " opts nil t nil nil "— leave unset —")))
@@ -443,7 +652,7 @@ Relies on a TEAM_ID property at the parent level."
       ((pred (string-prefix-p "4")) 4)
       (_ nil))))
 
-(defun linear--issue-create (team-id title description &optional assignee-id state-id priority)
+(defun org-linear--issue-create (team-id title description &optional assignee-id state-id priority)
   "Create a Linear issue; return alist with id/identifier/url (or signal error)."
   (let* ((q "mutation($input: IssueCreateInput!){
                issueCreate(input:$input){
@@ -464,18 +673,18 @@ Relies on a TEAM_ID property at the parent level."
                (when priority    (puthash "priority" priority h))
                h))
          (vars (let ((h (make-hash-table :test 'equal))) (puthash "input" in h) h))
-         (data (linear--graphql q vars))
-         (node (linear--alist-get-in '(issueCreate issue) data)))
+         (data (org-linear--graphql q vars))
+         (node (org-linear--alist-get-in '(issueCreate issue) data)))
     (unless node (error "Linear returned no issue node"))
     node))
 
 ;;;###autoload
-(defun linear-org-create-issue-from-subtree (&optional team-id)
+(defun org-linear-create-issue-from-subtree (&optional team-id)
   "Create a Linear issue using the current Org subtree.
 Prompts for Team/State/Assignee/Priority, uses heading as title and body as description.
 Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes heading with [KEY-###]."
   (interactive)
-  (linear--assert-auth)
+  (org-linear--assert-auth)
   (save-excursion
     (org-back-to-heading t)
     (let* ((default-team (or team-id
@@ -487,18 +696,18 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
                                        (when id (throw 'found id))))
                                    (goto-char here))
                                  nil))))
-           (team   (linear--read-team default-team))
-           (title  (linear--org-subtree-title))
-           (body   (linear--org-subtree-body))
-           (state  (linear--read-state team))
-           (assn   (linear--read-assignee team))
-           (prio   (linear--read-priority))
-           (issue  (linear--issue-create team title body assn state prio))
+           (team   (org-linear--read-team default-team))
+           (title  (org-linear--org-subtree-title))
+           (body   (org-linear--org-subtree-body))
+           (state  (org-linear--read-state team))
+           (assn   (org-linear--read-assignee team))
+           (prio   (org-linear--read-priority))
+           (issue  (org-linear--issue-create team title body assn state prio))
            (identifier (alist-get 'identifier issue))
            (url        (alist-get 'url issue))
-           (state-name (linear--alist-get-in '(state name) issue))
-           (assignee   (or (linear--alist-get-in '(assignee name) issue)
-                           (linear--alist-get-in '(assignee displayName) issue)
+           (state-name (org-linear--alist-get-in '(state name) issue))
+           (assignee   (or (org-linear--alist-get-in '(assignee name) issue)
+                           (org-linear--alist-get-in '(assignee displayName) issue)
                            "—"))
            (priority   (alist-get 'priority issue)))
       ;; Update PROPERTIES
@@ -509,7 +718,7 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
       (org-set-property "PRIORITY"  (if priority (number-to-string priority) ""))
       ;; Update heading to include identifier prefix
       (let* ((current (org-get-heading t t t t))
-             (new     (if (string-match-p (rx bol "[" (+ (not ?])) "] ") current)
+             (new     (if (string-match-p (rx bol "[" (+ (not ?\])) "] ") current)
                           current
                         (format "[%s] %s" identifier current))))
         (org-edit-headline new))
@@ -517,21 +726,94 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
 
 ;;;; Minor mode & keymap
 
-(defvar linear-org-mode-map
+(defvar org-linear-mode-map
   (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "C-c l i") #'linear-org-insert-issues-for-team)
-    (define-key m (kbd "C-c l o") #'linear-org-open-at-point)
-    (define-key m (kbd "C-c l r") #'linear-org-refresh-under-heading)
-    (define-key m (kbd "C-c l c") #'linear-org-create-issue-from-subtree)
+    (define-key m (kbd "C-c l i") #'org-linear-insert-issues-for-team)
+    (define-key m (kbd "C-c l o") #'org-linear-open-at-point)
+    (define-key m (kbd "C-c l r") #'org-linear-refresh-under-heading)
+    (define-key m (kbd "C-c l c") #'org-linear-create-issue-from-subtree)
     m)
-  "Keymap for `linear-org-mode`.")
+  "Keymap for `org-linear-mode`.")
 
 ;;;###autoload
-(define-minor-mode linear-org-mode
+(define-minor-mode org-linear-mode
   "Minor mode with keybindings for Linear ↔ Org workflows."
   :init-value nil
   :lighter " LinearOrg"
-  :keymap linear-org-mode-map)
+  :keymap org-linear-mode-map)
 
-(provide 'linear-org)
-;;; linear-org.el ends here
+;;; Fetch issues assigned to current user
+
+(defun org-linear--current-user-id ()
+  "Return the current authenticated user's Linear ID."
+  (let* ((q "query { viewer { id } }")
+         (data (org-linear--graphql q)))
+    (org-linear--alist-get-in '(viewer id) data)))
+
+(defun org-linear--issues-for-current-user ()
+  "Return a list of open issues assigned to the current user."
+  (let* ((user-id (org-linear--current-user-id))
+         (query
+          "query($assigneeId: ID!, $first: Int!, $after: String) {
+             issues(
+               filter: { assignee: { id: { eq: $assigneeId } }, state: { type: { neq: \"canceled\" } } }
+               orderBy: updatedAt
+               first: $first
+               after: $after
+             ) {
+               pageInfo { hasNextPage endCursor }
+               nodes {
+                 id identifier title url
+                 state { id name type }
+                 priority
+                 assignee { id name displayName }
+                 createdAt updatedAt
+               }
+             }
+           }")
+         (results nil)
+         (after nil)
+         (guard 0)
+         has-next prev-cursor)
+    (setq has-next t)
+    (while (and has-next (< guard 500))
+      (cl-incf guard)
+      (let* ((vars (let ((ht (make-hash-table :test 'equal)))
+                     (puthash "assigneeId" user-id ht)
+                     (puthash "first" (or org-linear-issues-page-size 50) ht)
+                     (when after (puthash "after" after ht))
+                     ht))
+             (data (org-linear--graphql query vars))
+             (issues (alist-get 'issues data))
+             (page (alist-get 'pageInfo issues))
+             (nodes (alist-get 'nodes issues)))
+        (setq results (nconc results (append nodes nil)))
+        (setq prev-cursor after
+              after (alist-get 'endCursor page)
+              has-next (org-linear--truthy (alist-get 'hasNextPage page)))
+        (when (and (not has-next) (equal after prev-cursor))
+          (setq has-next nil))))
+    results))
+
+;;;###autoload
+(defun org-linear-insert-issues-for-current-user ()
+  "Insert open Linear issues assigned to the current user as Org headings."
+  (interactive)
+  (org-linear--assert-auth)
+  (let* ((issues (org-linear--issues-for-current-user)))
+    (unless issues
+      (user-error "No issues assigned to current user"))
+    (save-excursion
+      (unless (org-before-first-heading-p)
+        (org-back-to-heading t)
+        (org-end-of-subtree t t)
+        (unless (bolp) (insert "\n")))
+      (insert (format "* Linear Issues assigned to me (synced %s)\n"
+                      (format-time-string "%Y-%m-%d %H:%M")))
+      (dolist (iss issues)
+        (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading headline props)))
+      (message "Inserted %d issues assigned to current user" (length issues)))))
+
+(provide 'org-linear)
+;;; org-linear.el ends here
