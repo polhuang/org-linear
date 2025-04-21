@@ -52,12 +52,12 @@
   :type 'string
   :group 'org-linear)
 
-(defcustom org-linear-client-id "195109b12876be343bad55f93cb30172"
+(defcustom org-linear-client-id ""
   "Client ID for Linear OAuth2 application."
   :type 'string
   :group 'org-linear)
 
-(defcustom org-linear-client-secret "d3ee010b6a76ff78a1e1cacaeb352356"
+(defcustom org-linear-client-secret ""
   "Client secret for Linear OAuth2 application."
   :type 'string
   :group 'org-linear)
@@ -84,17 +84,6 @@
   "Host for Linear API authentication storage."
   :type 'string
   :group 'org-linear-auth)
-
-(defcustom org-linear-auth-user "token"
-  "User identifier for Linear token storage."
-  :type 'string
-  :group 'org-linear-auth)
-
-(defvar org-linear--cached-token nil
-  "Cached access token to avoid repeated auth-source lookups.")
-
-(defvar org-linear--token-expiry nil
-  "Timestamp when cached token expires.")
 
 (defun org-linear-auth--read-token ()
   "Read Linear access token from auth-source with caching.
@@ -146,6 +135,67 @@ REFRESH-TOKEN and EXPIRES-IN are stored for future use."
                                     (time-add (current-time) expires-in)
                                   (time-add (current-time) (* 3600 24)))))))
 
+(defun org-linear-auth--read-refresh-token ()
+  "Read Linear refresh token from auth-source.
+ Returns refresh token string or nil if not found."
+  (when-let* ((auth-info (auth-source-search
+                         :host org-linear-auth-host
+                         :user (concat org-linear-auth-user "-refresh")
+                         :port "https"
+                         :require '(:secret)
+                         :max 1))
+              (auth-entry (car auth-info))
+              (secret-fn (plist-get auth-entry :secret)))
+    (let ((token (if (functionp secret-fn) (funcall secret-fn) secret-fn)))
+      (when (and token (stringp token) (> (length (string-trim token)) 0))
+        token))))
+
+(defun org-linear-auth--refresh-token ()
+  "Refresh the access token using the stored refresh token.
+Returns t on success, nil on failure."
+  (let ((refresh-token (org-linear-auth--read-refresh-token)))
+    (unless refresh-token
+      (message "No refresh token available. Please re-authenticate.")
+      (return nil))
+
+    (pcase-let* ((`(,client-id . ,client-secret) (condition-case nil
+                                                      (org-linear-auth--read-client-credentials)
+                                                    (error nil)))
+                 (success-flag nil))
+      (unless (and client-id client-secret)
+        (message "Cannot refresh token: missing client credentials")
+        (return nil))
+
+      (request
+       "https://api.linear.app/oauth/token"
+       :type "POST"
+       :sync t
+       :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
+       :data (format (concat "refresh_token=%s"
+                            "&client_id=%s"
+                            "&client_secret=%s"
+                            "&grant_type=refresh_token")
+                     (url-hexify-string refresh-token)
+                     (url-hexify-string client-id)
+                     (url-hexify-string client-secret))
+       :parser 'json-read
+       :success (cl-function
+                 (lambda (&key data &allow-other-keys)
+                   (let ((access-token (alist-get 'access_token data))
+                         (new-refresh-token (alist-get 'refresh_token data))
+                         (expires-in (alist-get 'expires_in data)))
+                     (when access-token
+                       (org-linear-auth--write-token access-token
+                                                  (or new-refresh-token refresh-token)
+                                                  expires-in)
+                       (setq success-flag t)
+                       (message "Successfully refreshed Linear access token")))))
+       :error (cl-function
+               (lambda (&key error-thrown response &allow-other-keys)
+                 (let ((status (when response (request-response-status-code response))))
+                   (message "Failed to refresh token (HTTP %s): %S" status error-thrown)))))
+      success-flag)))
+
 (defun org-linear-auth-clear ()
   "Clear stored Linear authentication tokens."
   (interactive)
@@ -162,7 +212,7 @@ REFRESH-TOKEN and EXPIRES-IN are stored for future use."
         (when-let ((delete-fn (plist-get entry :delete)))
           (funcall delete-fn)
           (cl-incf deleted))))
-    
+
     ;; Clear refresh token
     (when-let ((auth-info (auth-source-search
                           :host org-linear-auth-host
@@ -173,8 +223,14 @@ REFRESH-TOKEN and EXPIRES-IN are stored for future use."
         (when-let ((delete-fn (plist-get entry :delete)))
           (funcall delete-fn)
           (cl-incf deleted))))
-    
+
     (message "Cleared %d Linear auth token(s)" deleted)))
+
+;;;###autoload
+(defun org-linear-auth-revoke ()
+  "Revoke Linear authentication by deleting stored access and refresh tokens."
+  (interactive)
+  (org-linear-auth-clear))
 
 (defun org-linear-auth--read-client-credentials ()
   "Read client credentials from environment or auth-source.
@@ -374,23 +430,44 @@ Returns (client-id . client-secret) or signals error."
 
 (defun org-linear--graphql (query &optional variables)
   "Execute a synchronous GraphQL REQUEST with QUERY and VARIABLES.
-Returns parsed JSON as an alist, or signals an error with details."
+Returns parsed JSON as an alist, or signals an error with details.
+Automatically refreshes token on 401 and retries once."
   (let ((token (org-linear--assert-auth))
-        resp err resp-buf)
-    (request
-     org-linear-graphql-endpoint
-     :type "POST"
-     :sync t
-     :headers `(("Content-Type" . "application/json")
-                ("Authorization" . ,(concat "Bearer " (string-trim token))))
-     :data (json-encode `(("query" . ,query)
-                          ("variables" . ,(or variables (make-hash-table :test 'equal)))))
-     :parser 'json-read
-     :success (cl-function (lambda (&key data &allow-other-keys) (setq resp data)))
-     :error   (cl-function
-               (lambda (&key error-thrown response &allow-other-keys)
-                 (setq err error-thrown
-                       resp-buf (and response (request-response-buffer response))))))
+        (retry-count 0)
+        resp err resp-buf status-code)
+    (while (< retry-count 2)
+      (setq resp nil err nil resp-buf nil status-code nil)
+      (request
+       org-linear-graphql-endpoint
+       :type "POST"
+       :sync t
+       :headers `(("Content-Type" . "application/json")
+                  ("Authorization" . ,(concat "Bearer " (string-trim token))))
+       :data (json-encode `(("query" . ,query)
+                            ("variables" . ,(or variables (make-hash-table :test 'equal)))))
+       :parser 'json-read
+       :success (cl-function (lambda (&key data &allow-other-keys) (setq resp data)))
+       :error   (cl-function
+                 (lambda (&key error-thrown response &allow-other-keys)
+                   (setq err error-thrown
+                         resp-buf (and response (request-response-buffer response))
+                         status-code (and response (request-response-status-code response))))))
+
+      ;; Check if we got a 401 and should retry with refreshed token
+      (if (and (= retry-count 0)
+               (or (= status-code 401)
+                   (and err (string-match-p "401\\|[Uu]nauthorized" (format "%s" err)))))
+          ;; Try to refresh token and retry
+          (if (org-linear-auth--refresh-token)
+              (progn
+                (setq token (org-linear--assert-auth))
+                (cl-incf retry-count)
+                (message "Retrying request with refreshed token..."))
+            ;; Refresh failed, break out of loop
+            (setq retry-count 2))
+        ;; Not a 401 or already retried, break out of loop
+        (setq retry-count 2)))
+
     (when err
       (let ((raw (and resp-buf (with-current-buffer resp-buf (buffer-string)))))
         (error "Linear GraphQL request failed: %S\nRaw: %s" err (or raw ""))))
