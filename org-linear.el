@@ -1,8 +1,7 @@
 ;;; org-linear.el --- Org-mode integration for Linear.app  -*- lexical-binding: t; -*-
-;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
-;; End-to-end Linear ↔ Org workflow:
+;; End-to-end Linear <--> Org workflow:
 ;; - OAuth (authorize, local callback, token exchange)
 ;; - Insert team issues into Org as headings
 ;; - Open issue URL from heading
@@ -26,6 +25,10 @@
 (require 'subr-x)        ;; string-empty-p, string-trim
 (require 'simple-httpd)  ;; defservlet / httpd-start
 (require 'auth-source)   ;; secure authentication
+
+;; Note: Using request.el struct accessors:
+;; - request-response-status-code (public accessor)
+;; - request-response--buffer (internal accessor)
 
 (defgroup org-linear nil
   "Integration with Linear."
@@ -78,6 +81,12 @@
 (defvar org-linear-oauth-pkce-verifier nil
   "PKCE code verifier for OAuth flow.")
 
+(defvar org-linear--cached-token nil
+  "Cached access token for performance.")
+
+(defvar org-linear--token-expiry nil
+  "Expiry time for cached token.")
+
 ;;;; Authentication helpers
 
 (defcustom org-linear-auth-host "api.linear.app"
@@ -85,55 +94,78 @@
   :type 'string
   :group 'org-linear-auth)
 
+(defcustom org-linear-auth-user "access-token"
+  "User identifier for Linear API authentication storage."
+  :type 'string
+  :group 'org-linear-auth)
+
 (defun org-linear-auth--read-token ()
   "Read Linear access token from auth-source with caching.
 Returns token string or nil if not found."
-  ;; Return cached token if still valid
-  (when (and org-linear--cached-token 
-             org-linear--token-expiry
-             (time-less-p (current-time) org-linear--token-expiry))
-    (return org-linear--cached-token))
-  
-  ;; Look up token from auth-source
-  (when-let* ((auth-info (auth-source-search
-                         :host org-linear-auth-host
-                         :user org-linear-auth-user
-                         :port "https"
-                         :require '(:secret)
-                         :max 1))
-              (auth-entry (car auth-info))
-              (secret-fn (plist-get auth-entry :secret)))
-    (let ((token (if (functionp secret-fn) (funcall secret-fn) secret-fn)))
-      (when (and token (stringp token) (> (length (string-trim token)) 0))
-        (setq org-linear--cached-token token
-              org-linear--token-expiry (time-add (current-time) (* 3600 24))) ; Cache for 24h
-        token))))
+  (cl-block nil
+    ;; Return cached token if still valid
+    (when (and org-linear--cached-token
+               org-linear--token-expiry
+               (time-less-p (current-time) org-linear--token-expiry))
+      (cl-return org-linear--cached-token))
+
+    ;; Look up token from auth-source
+    (when-let* ((auth-info (auth-source-search
+                           :host org-linear-auth-host
+                           :user org-linear-auth-user
+                           :port "https"
+                           :require '(:secret)
+                           :max 1))
+                (auth-entry (car auth-info))
+                (secret-fn (plist-get auth-entry :secret)))
+      (let ((token (if (functionp secret-fn) (funcall secret-fn) secret-fn)))
+        (when (and token (stringp token) (> (length (string-trim token)) 0))
+          (setq org-linear--cached-token token
+                org-linear--token-expiry (time-add (current-time) (* 3600 24))) ; Cache for 24h
+          token)))))
 
 (defun org-linear-auth--write-token (token &optional refresh-token expires-in)
   "Write TOKEN to auth-source storage.
 REFRESH-TOKEN and EXPIRES-IN are stored for future use."
   (when (and token (stringp token) (> (length (string-trim token)) 0))
-    (let ((auth-source-save-behavior t))
-      ;; Store access token
-      (auth-source-store-save
-       :host org-linear-auth-host
-       :user org-linear-auth-user
-       :port "https"
-       :secret token)
-      
-      ;; Store refresh token if provided
-      (when (and refresh-token (stringp refresh-token) (> (length (string-trim refresh-token)) 0))
-        (auth-source-store-save
-         :host org-linear-auth-host
-         :user (concat org-linear-auth-user "-refresh")
-         :port "https"
-         :secret refresh-token))
-      
-      ;; Cache the token
-      (setq org-linear--cached-token token
-            org-linear--token-expiry (if expires-in
-                                    (time-add (current-time) expires-in)
-                                  (time-add (current-time) (* 3600 24)))))))
+    ;; Use auth-source-search with :create t to store credentials
+    (condition-case err
+        (let ((auth-source-save-behavior t))
+          ;; Store access token
+          (let ((result (auth-source-search
+                         :host org-linear-auth-host
+                         :user org-linear-auth-user
+                         :port "https"
+                         :secret token
+                         :create t
+                         :max 1)))
+            (when result
+              (let ((save-function (plist-get (car result) :save-function)))
+                (when save-function (funcall save-function)))))
+
+          ;; Store refresh token if provided
+          (when (and refresh-token (stringp refresh-token) (> (length (string-trim refresh-token)) 0))
+            (let ((result (auth-source-search
+                           :host org-linear-auth-host
+                           :user (concat org-linear-auth-user "-refresh")
+                           :port "https"
+                           :secret refresh-token
+                           :create t
+                           :max 1)))
+              (when result
+                (let ((save-function (plist-get (car result) :save-function)))
+                  (when save-function (funcall save-function))))))
+
+          (message "Tokens saved to auth-source successfully"))
+      (error
+       ;; Fallback: just cache in memory and show the actual error
+       (message "Unable to save tokens to auth-source (%s). Tokens cached in memory only." (error-message-string err))))
+
+    ;; Always cache the token in memory
+    (setq org-linear--cached-token token
+          org-linear--token-expiry (if expires-in
+                                      (time-add (current-time) expires-in)
+                                    (time-add (current-time) (* 3600 24))))))
 
 (defun org-linear-auth--read-refresh-token ()
   "Read Linear refresh token from auth-source.
@@ -153,18 +185,19 @@ REFRESH-TOKEN and EXPIRES-IN are stored for future use."
 (defun org-linear-auth--refresh-token ()
   "Refresh the access token using the stored refresh token.
 Returns t on success, nil on failure."
-  (let ((refresh-token (org-linear-auth--read-refresh-token)))
-    (unless refresh-token
-      (message "No refresh token available. Please re-authenticate.")
-      (return nil))
+  (cl-block nil
+    (let ((refresh-token (org-linear-auth--read-refresh-token)))
+      (unless refresh-token
+        (message "No refresh token available. Please re-authenticate.")
+        (cl-return nil))
 
-    (pcase-let* ((`(,client-id . ,client-secret) (condition-case nil
-                                                      (org-linear-auth--read-client-credentials)
-                                                    (error nil)))
-                 (success-flag nil))
-      (unless (and client-id client-secret)
-        (message "Cannot refresh token: missing client credentials")
-        (return nil))
+      (pcase-let* ((`(,client-id . ,client-secret) (condition-case nil
+                                                        (org-linear-auth--read-client-credentials)
+                                                      (error nil)))
+                   (success-flag nil))
+        (unless (and client-id client-secret)
+          (message "Cannot refresh token: missing client credentials")
+          (cl-return nil))
 
       (request
        "https://api.linear.app/oauth/token"
@@ -194,7 +227,7 @@ Returns t on success, nil on failure."
                (lambda (&key error-thrown response &allow-other-keys)
                  (let ((status (when response (request-response-status-code response))))
                    (message "Failed to refresh token (HTTP %s): %S" status error-thrown)))))
-      success-flag)))
+        success-flag))))
 
 (defun org-linear-auth-clear ()
   "Clear stored Linear authentication tokens."
@@ -203,28 +236,34 @@ Returns t on success, nil on failure."
         org-linear--token-expiry nil)
   (let ((deleted 0))
     ;; Clear access token
-    (when-let ((auth-info (auth-source-search
-                          :host org-linear-auth-host
-                          :user org-linear-auth-user
-                          :port "https"
-                          :max 1)))
-      (dolist (entry auth-info)
-        (when-let ((delete-fn (plist-get entry :delete)))
-          (funcall delete-fn)
-          (cl-incf deleted))))
+    (condition-case nil
+        (when-let ((auth-info (auth-source-search
+                              :host org-linear-auth-host
+                              :user org-linear-auth-user
+                              :port "https"
+                              :max 1)))
+          (dolist (entry auth-info)
+            (when-let ((delete-fn (plist-get entry :delete)))
+              (funcall delete-fn)
+              (cl-incf deleted))))
+      (error nil))
 
     ;; Clear refresh token
-    (when-let ((auth-info (auth-source-search
-                          :host org-linear-auth-host
-                          :user (concat org-linear-auth-user "-refresh")
-                          :port "https"
-                          :max 1)))
-      (dolist (entry auth-info)
-        (when-let ((delete-fn (plist-get entry :delete)))
-          (funcall delete-fn)
-          (cl-incf deleted))))
+    (condition-case nil
+        (when-let ((auth-info (auth-source-search
+                              :host org-linear-auth-host
+                              :user (concat org-linear-auth-user "-refresh")
+                              :port "https"
+                              :max 1)))
+          (dolist (entry auth-info)
+            (when-let ((delete-fn (plist-get entry :delete)))
+              (funcall delete-fn)
+              (cl-incf deleted))))
+      (error nil))
 
-    (message "Cleared %d Linear auth token(s)" deleted)))
+    (if (> deleted 0)
+        (message "Cleared %d Linear auth token(s)" deleted)
+      (message "Cleared cached tokens (auth-source entries may need manual removal)"))))
 
 ;;;###autoload
 (defun org-linear-auth-revoke ()
@@ -344,28 +383,35 @@ Returns (client-id . client-secret) or signals error."
 
 ;;;###autoload
 (defun org-linear-oauth-authorize ()
-  "Start the OAuth2 authorization process for Linear."
+  "Start the OAuth2 authorization process for Linear.
+Automatically starts the callback server if it's not already running."
   (interactive)
   (condition-case err
-      (pcase-let* ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials))
-                   (`(,verifier . ,challenge) (org-linear-auth--generate-pkce-pair))
-                   (state (org-linear-auth--generate-state))
-                   (url (format (concat "https://linear.app/oauth/authorize"
-                                        "?client_id=%s"
-                                        "&redirect_uri=%s"
-                                        "&response_type=code"
-                                        "&scope=read,write"
-                                        "&state=%s"
-                                        "&code_challenge=%s"
-                                        "&code_challenge_method=S256")
-                                (url-hexify-string client-id)
-                                (url-hexify-string org-linear-oauth-redirect-uri)
-                                (url-hexify-string state)
-                                (url-hexify-string challenge))))
-        (setq org-linear-oauth-state state
-              org-linear-oauth-pkce-verifier verifier)
-        (browse-url url)
-        (message "Opening browser for Linear OAuth… (Ensure callback server is running)"))
+      (progn
+        ;; Ensure callback server is running
+        (unless (and (boundp 'httpd-port) httpd-port
+                     (get-process "httpd"))
+          (org-linear-oauth-callback-server))
+
+        (pcase-let* ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials))
+                     (`(,verifier . ,challenge) (org-linear-auth--generate-pkce-pair))
+                     (state (org-linear-auth--generate-state))
+                     (url (format (concat "https://linear.app/oauth/authorize"
+                                          "?client_id=%s"
+                                          "&redirect_uri=%s"
+                                          "&response_type=code"
+                                          "&scope=read,write"
+                                          "&state=%s"
+                                          "&code_challenge=%s"
+                                          "&code_challenge_method=S256")
+                                  (url-hexify-string client-id)
+                                  (url-hexify-string org-linear-oauth-redirect-uri)
+                                  (url-hexify-string state)
+                                  (url-hexify-string challenge))))
+          (setq org-linear-oauth-state state
+                org-linear-oauth-pkce-verifier verifier)
+          (browse-url url)
+          (message "Opening browser for Linear OAuth…")))
     (error
      (message "Failed to start OAuth flow: %s" (error-message-string err)))))
 
@@ -400,12 +446,14 @@ Returns (client-id . client-secret) or signals error."
      :error (cl-function
              (lambda (&key error-thrown response &allow-other-keys)
                (let ((status (when response (request-response-status-code response)))
-                     (data (when response 
+                     (data (when response
                             (condition-case nil
-                                (with-current-buffer (request-response-buffer response)
-                                  (json-read-from-string (buffer-string)))
+                                (let ((buffer (request-response--buffer response)))
+                                  (when buffer
+                                    (with-current-buffer buffer
+                                      (json-read-from-string (buffer-string)))))
                               (error nil)))))
-                 (message "Error exchanging code for token (HTTP %s): %S. Data: %S" 
+                 (message "Error exchanging code for token (HTTP %s): %S. Data: %S"
                          status error-thrown data)))))))
 
 ;;;; GraphQL core
@@ -450,12 +498,12 @@ Automatically refreshes token on 401 and retries once."
        :error   (cl-function
                  (lambda (&key error-thrown response &allow-other-keys)
                    (setq err error-thrown
-                         resp-buf (and response (request-response-buffer response))
-                         status-code (and response (request-response-status-code response))))))
+                         resp-buf (when response (request-response--buffer response))
+                         status-code (when response (request-response-status-code response))))))
 
       ;; Check if we got a 401 and should retry with refreshed token
       (if (and (= retry-count 0)
-               (or (= status-code 401)
+               (or (and status-code (= status-code 401))
                    (and err (string-match-p "401\\|[Uu]nauthorized" (format "%s" err)))))
           ;; Try to refresh token and retry
           (if (org-linear-auth--refresh-token)
@@ -603,7 +651,8 @@ Automatically refreshes token on 401 and retries once."
                   ("STATE"      . ,(or state-name ""))
                   ("ASSIGNEE"   . ,assignee)
                   ("PRIORITY"   . ,(if priority (number-to-string priority) ""))
-                  ("URL"        . ,(or url "")) )))
+                  ("URL"        . ,(or url ""))
+                  ("UPDATED"    . ,(format-time-string "%Y-%m-%d %H:%M")) )))
     (cons headline props)))
 
 (defun org-linear--insert-org-heading (headline props)
@@ -633,9 +682,8 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
         (org-back-to-heading t)
         (org-end-of-subtree t t)
         (unless (bolp) (insert "\n")))
-      (insert (format "* Linear Issues for %s (synced %s)\n"
-                      (or team-label choice)
-                      (format-time-string "%Y-%m-%d %H:%M")))
+      (insert (format "* Linear Issues for %s\n"
+                      (or team-label choice)))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
         (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
@@ -672,6 +720,59 @@ Relies on a TEAM_ID property at the parent level."
           (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
             (org-linear--insert-org-heading headline props)))
         (message "Refreshed %d issues" (length issues))))))
+
+;;;; Property validation and conversion for bidirectional sync
+
+(defun org-linear--validate-assignee (assignee-name team-id)
+  "Convert ASSIGNEE-NAME to user ID, return nil if invalid/unassigned."
+  (when (and assignee-name
+             (not (string-empty-p (string-trim assignee-name)))
+             (not (string-prefix-p "—" assignee-name)))
+    (let* ((users (org-linear--users 200))
+           (match (cl-find-if (lambda (pair)
+                               (string= (car pair) (string-trim assignee-name)))
+                             users)))
+      (when match (cdr match)))))
+
+(defun org-linear--validate-state (state-name team-id)
+  "Convert STATE-NAME to state ID, return nil if invalid."
+  (when (and state-name
+             (not (string-empty-p (string-trim state-name)))
+             (not (string-prefix-p "—" state-name)))
+    (let* ((states (org-linear--team-states team-id))
+           (match (cl-find-if (lambda (pair)
+                               (let ((display (car pair)))
+                                 (or (string= display (string-trim state-name))
+                                     (string= (replace-regexp-in-string " (.*)" "" display)
+                                             (string-trim state-name)))))
+                             states)))
+      (when match (cdr match)))))
+
+(defun org-linear--validate-priority (priority-str)
+  "Convert PRIORITY-STR to integer priority, return nil if invalid."
+  (when (and priority-str
+             (not (string-empty-p (string-trim priority-str)))
+             (string-match-p "^[0-4]$" (string-trim priority-str)))
+    (string-to-number (string-trim priority-str))))
+
+(defun org-linear--extract-title-from-heading (heading)
+  "Extract clean title from Org HEADING, removing [IDENTIFIER] prefix if present."
+  (let ((clean (string-trim heading)))
+    (if (string-match "^\\[\\([A-Z]+-[0-9]+\\)\\] \\(.*\\)" clean)
+        (match-string 2 clean)
+      clean)))
+
+(defun org-linear--get-team-id-for-issue (linear-id)
+  "Get team ID for an issue by querying Linear API with LINEAR-ID."
+  (let* ((q "query($id: String!) {
+               issue(id: $id) {
+                 team { id }
+               }
+             }")
+         (vars (let ((h (make-hash-table :test 'equal)))
+                 (puthash "id" linear-id h) h))
+         (data (org-linear--graphql q vars)))
+    (org-linear--alist-get-in '(issue team id) data)))
 
 ;;;; Create issue from Org subtree
 
@@ -755,6 +856,37 @@ Relies on a TEAM_ID property at the parent level."
     (unless node (error "Linear returned no issue node"))
     node))
 
+(defun org-linear--issue-update (issue-id &optional title description assignee-id state-id priority)
+  "Update a Linear issue; return alist with updated issue data (or signal error)."
+  (let* ((q "mutation($id: String!, $input: IssueUpdateInput!){
+               issueUpdate(id: $id, input: $input){
+                 success
+                 issue{ id identifier url title
+                        state{ id name type }
+                        assignee{ id name displayName }
+                        priority priorityLabel }
+               }
+             }")
+         (in (let ((h (make-hash-table :test 'equal)))
+               (when (and title (> (length (string-trim title)) 0))
+                 (puthash "title" title h))
+               (when (and description (> (length (string-trim description)) 0))
+                 (puthash "description" description h))
+               (when assignee-id (puthash "assigneeId" assignee-id h))
+               (when state-id    (puthash "stateId" state-id h))
+               (when priority    (puthash "priority" priority h))
+               h))
+         (vars (let ((h (make-hash-table :test 'equal)))
+                 (puthash "id" issue-id h)
+                 (puthash "input" in h)
+                 h))
+         (data (org-linear--graphql q vars))
+         (success (org-linear--alist-get-in '(issueUpdate success) data))
+         (node (org-linear--alist-get-in '(issueUpdate issue) data)))
+    (unless success (error "Linear issue update failed"))
+    (unless node (error "Linear returned no issue node after update"))
+    node))
+
 ;;;###autoload
 (defun org-linear-create-issue-from-subtree (&optional team-id)
   "Create a Linear issue using the current Org subtree.
@@ -801,14 +933,294 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
         (org-edit-headline new))
       (message "Created Linear issue %s → %s" identifier url))))
 
+;;;; Configuration for bidirectional sync
+
+(defcustom org-linear-auto-sync t
+  "Whether to automatically sync Org property changes to Linear.
+When enabled, changes to STATE, ASSIGNEE, and PRIORITY properties
+will automatically sync to Linear."
+  :type 'boolean
+  :group 'org-linear)
+
+(defcustom org-linear-auto-sync-properties '("STATE" "ASSIGNEE" "PRIORITY")
+  "List of properties that trigger automatic sync when changed."
+  :type '(repeat string)
+  :group 'org-linear)
+
+(defcustom org-linear-conflict-resolution 'prompt
+  "How to handle sync conflicts.
+'prompt - Ask user what to do
+'linear-wins - Always use Linear values
+'org-wins - Always use Org values"
+  :type '(choice (const :tag "Prompt user" prompt)
+                 (const :tag "Linear wins" linear-wins)
+                 (const :tag "Org wins" org-wins))
+  :group 'org-linear)
+
+;;;; Conflict detection and resolution
+
+(defun org-linear--fetch-current-issue-state (linear-id)
+  "Fetch current state of issue from Linear API."
+  (let* ((q "query($id: String!) {
+               issue(id: $id) {
+                 id identifier title updatedAt
+                 state { id name }
+                 assignee { id name displayName }
+                 priority
+               }
+             }")
+         (vars (let ((h (make-hash-table :test 'equal)))
+                 (puthash "id" linear-id h) h))
+         (data (org-linear--graphql q vars)))
+    (alist-get 'issue data)))
+
+(defun org-linear--detect-conflicts (linear-id org-state org-assignee org-priority)
+  "Detect if Linear issue has changed since last sync.
+Returns alist of conflicts or nil if no conflicts."
+  (let* ((current-issue (org-linear--fetch-current-issue-state linear-id))
+         (linear-state (org-linear--alist-get-in '(state name) current-issue))
+         (linear-assignee (or (org-linear--alist-get-in '(assignee displayName) current-issue)
+                             (org-linear--alist-get-in '(assignee name) current-issue)
+                             "—"))
+         (linear-priority (alist-get 'priority current-issue))
+         (linear-priority-str (when linear-priority (number-to-string linear-priority)))
+         (conflicts nil))
+
+    ;; Check for conflicts (both sides have non-empty values that differ)
+    (when (and org-state linear-state
+               (not (string= (string-trim org-state) (string-trim linear-state))))
+      (push `(state . ((org . ,org-state) (linear . ,linear-state))) conflicts))
+
+    (when (and org-assignee linear-assignee
+               (not (string= (string-trim org-assignee) (string-trim linear-assignee))))
+      (push `(assignee . ((org . ,org-assignee) (linear . ,linear-assignee))) conflicts))
+
+    (when (and org-priority linear-priority-str
+               (not (string= (string-trim org-priority) (string-trim linear-priority-str))))
+      (push `(priority . ((org . ,org-priority) (linear . ,linear-priority-str))) conflicts))
+
+    conflicts))
+
+(defun org-linear--resolve-conflicts (conflicts)
+  "Resolve conflicts based on user configuration.
+Returns alist of (property . resolved-value) pairs."
+  (let ((resolutions nil))
+    (dolist (conflict conflicts)
+      (let* ((property (car conflict))
+             (values (cdr conflict))
+             (org-val (alist-get 'org values))
+             (linear-val (alist-get 'linear values))
+             (resolved-val
+              (pcase org-linear-conflict-resolution
+                ('linear-wins linear-val)
+                ('org-wins org-val)
+                ('prompt
+                 (let ((choice (completing-read
+                               (format "Conflict in %s. Choose value: " property)
+                               `(,(format "Org: %s" org-val)
+                                 ,(format "Linear: %s" linear-val))
+                               nil t)))
+                   (if (string-prefix-p "Org:" choice) org-val linear-val))))))
+        (push `(,property . ,resolved-val) resolutions)))
+    resolutions))
+
+;;;; Automatic sync hooks
+
+(defvar org-linear--sync-in-progress nil
+  "Flag to prevent recursive sync calls.")
+
+(defun org-linear--property-changed-hook (property new-value)
+  "Hook function called when an Org property changes.
+PROPERTY is the name of the property, NEW-VALUE is the new value."
+  (when (and org-linear-auto-sync
+             (not org-linear--sync-in-progress)
+             (member property org-linear-auto-sync-properties))
+    ;; Check if we're in a heading with a LINEAR_ID
+    (when (org-entry-get (point) "LINEAR_ID")
+      (condition-case err
+          (progn
+            (setq org-linear--sync-in-progress t)
+            (org-linear-sync-to-linear)
+            (setq org-linear--sync-in-progress nil))
+        (error
+         (setq org-linear--sync-in-progress nil)
+         (message "Auto-sync failed: %s" (error-message-string err)))))))
+
+;; Add our hook to org-property-changed-functions
+(add-hook 'org-property-changed-functions #'org-linear--property-changed-hook)
+
+;;;; Bidirectional sync commands
+
+;;;###autoload
+(defun org-linear-sync-to-linear ()
+  "Sync current Org heading's properties to Linear.
+Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org."
+  (interactive)
+  (org-linear--assert-auth)
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((linear-id (org-entry-get (point) "LINEAR_ID"))
+           (org-title (org-linear--extract-title-from-heading
+                       (org-linear--org-subtree-title)))
+           (org-state (org-entry-get (point) "STATE"))
+           (org-assignee (org-entry-get (point) "ASSIGNEE"))
+           (org-priority (org-entry-get (point) "PRIORITY")))
+
+      (unless linear-id
+        (user-error "No LINEAR_ID property on this heading"))
+
+      ;; Check for conflicts before syncing
+      (let* ((conflicts (org-linear--detect-conflicts linear-id org-state org-assignee org-priority)))
+        (when conflicts
+          (let ((resolutions (org-linear--resolve-conflicts conflicts)))
+            ;; Apply resolved values back to Org properties
+            (dolist (resolution resolutions)
+              (let ((property (car resolution))
+                    (value (cdr resolution)))
+                (pcase property
+                  ('state (setq org-state value))
+                  ('assignee (setq org-assignee value))
+                  ('priority (setq org-priority value)))))))
+
+        ;; Get team ID for validation
+        (let* ((team-id (org-linear--get-team-id-for-issue linear-id))
+               (assignee-id (org-linear--validate-assignee org-assignee team-id))
+               (state-id (org-linear--validate-state org-state team-id))
+               (priority (org-linear--validate-priority org-priority))
+               (has-changes (or org-title org-state org-assignee org-priority)))
+
+          (unless team-id
+            (user-error "Could not determine team for Linear issue %s" linear-id))
+
+          (if has-changes
+              (let* ((updated-issue (org-linear--issue-update
+                                    linear-id
+                                    org-title
+                                    nil ; description - not syncing body for now
+                                    assignee-id
+                                    state-id
+                                    priority))
+                     (new-state (org-linear--alist-get-in '(state name) updated-issue))
+                     (new-assignee (or (org-linear--alist-get-in '(assignee displayName) updated-issue)
+                                      (org-linear--alist-get-in '(assignee name) updated-issue)
+                                      "—"))
+                     (new-priority (alist-get 'priority updated-issue))
+                     (identifier (alist-get 'identifier updated-issue)))
+
+                ;; Update Org properties with confirmed Linear values
+                (when new-state (org-set-property "STATE" new-state))
+                (org-set-property "ASSIGNEE" new-assignee)
+                (when new-priority
+                  (org-set-property "PRIORITY" (number-to-string new-priority)))
+
+                ;; Add sync timestamp
+                (org-set-property "LINEAR_LAST_SYNC"
+                                 (format-time-string "%Y-%m-%d %H:%M:%S"))
+
+                (message "Synced %s to Linear successfully" identifier))
+            (message "No changes to sync to Linear")))))))
+
+;;;###autoload
+(defun org-linear-sync-from-linear ()
+  "Pull latest changes from Linear for current issue and update Org properties."
+  (interactive)
+  (org-linear--assert-auth)
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((linear-id (org-entry-get (point) "LINEAR_ID")))
+      (unless linear-id
+        (user-error "No LINEAR_ID property on this heading"))
+
+      (let* ((current-issue (org-linear--fetch-current-issue-state linear-id))
+             (linear-state (org-linear--alist-get-in '(state name) current-issue))
+             (linear-assignee (or (org-linear--alist-get-in '(assignee displayName) current-issue)
+                                 (org-linear--alist-get-in '(assignee name) current-issue)
+                                 "—"))
+             (linear-priority (alist-get 'priority current-issue))
+             (identifier (alist-get 'identifier current-issue)))
+
+        ;; Update Org properties with Linear values
+        (when linear-state (org-set-property "STATE" linear-state))
+        (org-set-property "ASSIGNEE" linear-assignee)
+        (when linear-priority
+          (org-set-property "PRIORITY" (number-to-string linear-priority)))
+        (org-set-property "LINEAR_LAST_SYNC"
+                         (format-time-string "%Y-%m-%d %H:%M:%S"))
+
+        (message "Updated %s from Linear" identifier)))))
+
+;;;###autoload
+(defun org-linear-sync-status ()
+  "Show sync status for current Linear issue."
+  (interactive)
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((linear-id (org-entry-get (point) "LINEAR_ID"))
+           (last-sync (org-entry-get (point) "LINEAR_LAST_SYNC"))
+           (org-state (org-entry-get (point) "STATE"))
+           (org-assignee (org-entry-get (point) "ASSIGNEE"))
+           (org-priority (org-entry-get (point) "PRIORITY")))
+
+      (unless linear-id
+        (user-error "No LINEAR_ID property on this heading"))
+
+      (let* ((current-issue (org-linear--fetch-current-issue-state linear-id))
+             (linear-state (org-linear--alist-get-in '(state name) current-issue))
+             (linear-assignee (or (org-linear--alist-get-in '(assignee displayName) current-issue)
+                                 (org-linear--alist-get-in '(assignee name) current-issue)
+                                 "—"))
+             (linear-priority (alist-get 'priority current-issue))
+             (linear-priority-str (when linear-priority (number-to-string linear-priority)))
+             (identifier (alist-get 'identifier current-issue))
+             (conflicts (org-linear--detect-conflicts linear-id org-state org-assignee org-priority)))
+
+        (message "%s | Last sync: %s | %s"
+                identifier
+                (or last-sync "Never")
+                (if conflicts
+                    (format "CONFLICTS: %s" (mapconcat (lambda (c) (symbol-name (car c))) conflicts ", "))
+                  "In sync"))))))
+
+;;;###autoload
+(defun org-linear-sync-subtree-to-linear ()
+  "Sync all Linear issues under current heading to Linear.
+Processes all child headings with LINEAR_ID properties."
+  (interactive)
+  (org-linear--assert-auth)
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((synced-count 0)
+          (error-count 0))
+      (org-map-entries
+       (lambda ()
+         (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
+           (when linear-id
+             (condition-case err
+                 (progn
+                   (org-linear-sync-to-linear)
+                   (cl-incf synced-count))
+               (error
+                (cl-incf error-count)
+                (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
+       nil 'tree)
+      (message "Synced %d issues to Linear (%d errors)" synced-count error-count))))
+
 ;;;; Minor mode & keymap
 
 (defvar org-linear-mode-map
   (let ((m (make-sparse-keymap)))
+    ;; Original commands
     (define-key m (kbd "C-c l i") #'org-linear-insert-issues-for-team)
     (define-key m (kbd "C-c l o") #'org-linear-open-at-point)
     (define-key m (kbd "C-c l r") #'org-linear-refresh-under-heading)
     (define-key m (kbd "C-c l c") #'org-linear-create-issue-from-subtree)
+    ;; Bidirectional sync commands
+    (define-key m (kbd "C-c l s") #'org-linear-sync-to-linear)
+    (define-key m (kbd "C-c l p") #'org-linear-sync-from-linear)
+    (define-key m (kbd "C-c l S") #'org-linear-sync-subtree-to-linear)
+    (define-key m (kbd "C-c l ?") #'org-linear-sync-status)
+    ;; User issues
+    (define-key m (kbd "C-c l u") #'org-linear-insert-issues-for-current-user)
     m)
   "Keymap for `org-linear-mode`.")
 
@@ -885,8 +1297,7 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
         (org-back-to-heading t)
         (org-end-of-subtree t t)
         (unless (bolp) (insert "\n")))
-      (insert (format "* Linear Issues assigned to me (synced %s)\n"
-                      (format-time-string "%Y-%m-%d %H:%M")))
+      (insert (format "* Linear Issues assigned to me\n"))
       (dolist (iss issues)
         (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
           (org-linear--insert-org-heading headline props)))
