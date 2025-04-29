@@ -70,6 +70,12 @@
   :type 'integer
   :group 'org-linear)
 
+(defcustom org-linear-directory ".org-linear"
+  "Directory to store Linear team issue files.
+Each team's issues will be stored in [TEAM].org within this directory."
+  :type 'string
+  :group 'org-linear)
+
 (defcustom org-linear-state-alist
   '(("TODO" . "Todo")
     ("IN-PROGRESS" . "In Progress")
@@ -257,26 +263,26 @@ Returns t on success, nil on failure."
   (let ((deleted 0))
     ;; Clear access token
     (condition-case nil
-        (when-let ((auth-info (auth-source-search
-                              :host org-linear-auth-host
-                              :user org-linear-auth-user
-                              :port "https"
-                              :max 1)))
+        (when-let* ((auth-info (auth-source-search
+                               :host org-linear-auth-host
+                               :user org-linear-auth-user
+                               :port "https"
+                               :max 1)))
           (dolist (entry auth-info)
-            (when-let ((delete-fn (plist-get entry :delete)))
+            (when-let* ((delete-fn (plist-get entry :delete)))
               (funcall delete-fn)
               (cl-incf deleted))))
       (error nil))
 
     ;; Clear refresh token
     (condition-case nil
-        (when-let ((auth-info (auth-source-search
-                              :host org-linear-auth-host
-                              :user (concat org-linear-auth-user "-refresh")
-                              :port "https"
-                              :max 1)))
+        (when-let* ((auth-info (auth-source-search
+                               :host org-linear-auth-host
+                               :user (concat org-linear-auth-user "-refresh")
+                               :port "https"
+                               :max 1)))
           (dolist (entry auth-info)
-            (when-let ((delete-fn (plist-get entry :delete)))
+            (when-let* ((delete-fn (plist-get entry :delete)))
               (funcall delete-fn)
               (cl-incf deleted))))
       (error nil))
@@ -594,6 +600,23 @@ Automatically refreshes token on 401 and retries once."
               (cons (alist-get 'name node) (alist-get 'id node)))
             (append nodes nil))))
 
+;;;; Team file management
+
+(defun org-linear--ensure-directory ()
+  "Ensure the org-linear directory exists. Return the absolute path."
+  (let ((dir (expand-file-name org-linear-directory)))
+    (unless (file-exists-p dir)
+      (make-directory dir t))
+    dir))
+
+(defun org-linear--team-file-path (team-name team-key)
+  "Return the file path for TEAM-NAME with TEAM-KEY.
+The filename will be sanitized to remove special characters."
+  (let* ((dir (org-linear--ensure-directory))
+         ;; Use team key as filename, sanitize it
+         (filename (format "%s.org" (replace-regexp-in-string "[^a-zA-Z0-9-]" "_" team-key))))
+    (expand-file-name filename dir)))
+
 ;;;; Workspace users (assignees)
 
 (defun org-linear--users (&optional n)
@@ -737,16 +760,21 @@ LABELS-DATA is the labels field from Linear API: { nodes: [...] }"
 
 (defun org-linear--insert-org-heading (todo-kw org-priority tags headline props)
   "Insert an Org subtree for HEADLINE with TODO-KW, ORG-PRIORITY, TAGS and PROPS alist."
-  (let ((priority-str (if org-priority (format " [#%c]" org-priority) ""))
-        (all-tags (if tags
-                     (append tags '("linear"))
-                   '("linear")))
-        (tags-str (mapconcat 'identity all-tags ":")))
-    (insert (format "** %s%s %s :%s:\n" (or todo-kw "TODO") priority-str headline tags-str)))
-  (insert ":PROPERTIES:\n")
-  (dolist (kv props)
-    (insert (format ":%s: %s\n" (car kv) (cdr kv))))
-  (insert ":END:\n"))
+  (let* ((priority-str (if org-priority (format " [#%c]" org-priority) ""))
+         (all-tags (if tags
+                      (append tags '("linear"))
+                    '("linear"))))
+    ;; Insert heading without tags first
+    (insert (format "* %s%s %s\n" (or todo-kw "TODO") priority-str headline))
+    ;; Move to the heading and set tags properly (this will align them)
+    (forward-line -1)
+    (org-set-tags all-tags)
+    (forward-line 1)
+    ;; Insert properties
+    (insert ":PROPERTIES:\n")
+    (dolist (kv props)
+      (insert (format ":%s: %s\n" (car kv) (cdr kv))))
+    (insert ":END:\n")))
 
 ;;;###autoload
 (defun org-linear-insert-issues-for-team (&optional team-id)
@@ -771,7 +799,7 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
                       (or team-label choice)))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
           (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
       (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
 
@@ -802,9 +830,32 @@ Relies on a TEAM_ID property at the parent level."
        nil 'children)
       (let ((issues (org-linear--issues-for-team team-id)))
         (dolist (iss issues)
-          (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
             (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
         (message "Refreshed %d issues" (length issues))))))
+
+;;;###autoload
+(defun org-linear-refresh-file ()
+  "Re-sync issues for the team file, replacing all `*` level entries.
+Relies on file-level #+PROPERTY: TEAM_ID."
+  (interactive)
+  (org-linear--assert-auth)
+  (let ((team-id (org-entry-get-with-inheritance "TEAM_ID")))
+    (unless team-id
+      (user-error "No TEAM_ID file property found"))
+    ;; Delete all top-level headings
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "^\\* " nil t)
+        (org-back-to-heading t)
+        (org-cut-subtree)))
+    ;; Re-insert all issues
+    (let ((issues (org-linear--issues-for-team team-id)))
+      (goto-char (point-max))
+      (dolist (iss issues)
+        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
+      (message "Refreshed %d issues" (length issues)))))
 
 ;;;; Property validation and conversion for bidirectional sync
 
@@ -1368,6 +1419,30 @@ Processes all child headings with LINEAR_ID properties."
        nil 'tree)
       (message "Synced %d issues to Linear (%d errors)" synced-count error-count))))
 
+;;;###autoload
+(defun org-linear-sync-subtree-from-linear ()
+  "Sync all Linear issues under current heading from Linear.
+Processes all child headings with LINEAR_ID properties."
+  (interactive)
+  (org-linear--assert-auth)
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((synced-count 0)
+          (error-count 0))
+      (org-map-entries
+       (lambda ()
+         (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
+           (when linear-id
+             (condition-case err
+                 (progn
+                   (org-linear-sync-from-linear)
+                   (cl-incf synced-count))
+               (error
+                (cl-incf error-count)
+                (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
+       nil 'tree)
+      (message "Synced %d issues from Linear (%d errors)" synced-count error-count))))
+
 ;;;; Minor mode & keymap
 
 (defvar org-linear-mode-map
@@ -1449,6 +1524,58 @@ Processes all child headings with LINEAR_ID properties."
     results))
 
 ;;;###autoload
+(defun org-linear-download-all-teams ()
+  "Download all team issues to separate files in `org-linear-directory'.
+Each team's issues are saved to [TEAM_KEY].org in the directory.
+Files are overwritten if they already exist."
+  (interactive)
+  (org-linear--assert-auth)
+  (let* ((teams (org-linear--teams))
+         (total-teams (length teams))
+         (team-count 0))
+    (unless teams
+      (user-error "No teams found"))
+
+    (message "Downloading issues for %d team(s)..." total-teams)
+
+    (dolist (team-pair teams)
+      (cl-incf team-count)
+      (let* ((display (car team-pair))
+             (team-id (cdr team-pair))
+             ;; Extract name and key from display string "Name (KEY)"
+             (name-key (if (string-match "\\(.*\\) (\\([^)]+\\))" display)
+                          (cons (match-string 1 display) (match-string 2 display))
+                        (cons display display)))
+             (team-name (car name-key))
+             (team-key (cdr name-key))
+             (file-path (org-linear--team-file-path team-name team-key))
+             (issues (org-linear--issues-for-team team-id)))
+
+        (message "[%d/%d] Downloading %s (%d issues)..."
+                 team-count total-teams team-name (length issues))
+
+        (with-temp-file file-path
+          (insert (format "#+TITLE: %s Linear Issues\n" team-name))
+          (insert (format "#+AUTHOR: Linear\n"))
+          (insert (format "#+DATE: %s\n" (format-time-string "%Y-%m-%d %H:%M:%S")))
+          (insert (format "#+PROPERTY: TEAM_ID %s\n" team-id))
+          (insert (format "#+PROPERTY: TEAM_NAME %s\n" team-name))
+          (insert (format "#+PROPERTY: TEAM_KEY %s\n\n" team-key))
+
+          (if issues
+              (dolist (iss issues)
+                (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props)
+                             (org-linear--issue->org-heading iss)))
+                  (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
+            (insert "No issues found.\n")))
+
+        (message "[%d/%d] Saved %s to %s"
+                 team-count total-teams team-name (file-name-nondirectory file-path))))
+
+    (message "Downloaded issues for %d team(s) to %s"
+             total-teams (expand-file-name org-linear-directory))))
+
+;;;###autoload
 (defun org-linear-insert-issues-for-current-user ()
   "Insert open Linear issues assigned to the current user as Org headings."
   (interactive)
@@ -1463,7 +1590,7 @@ Processes all child headings with LINEAR_ID properties."
         (unless (bolp) (insert "\n")))
       (insert (format "* Linear Issues assigned to me\n"))
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
           (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
       (message "Inserted %d issues assigned to current user" (length issues)))))
 
