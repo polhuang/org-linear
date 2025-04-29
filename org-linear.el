@@ -75,6 +75,12 @@
   :type 'integer
   :group 'org-linear)
 
+(defcustom org-linear-todo-keywords
+  '((sequence "TODO" "IN-PROGRESS" "IN-REVIEW" "BACKLOG" "BLOCKED" "|" "DONE"))
+  "TODO keywords for Linear issues in Org mode."
+  :type '(list (cons (const sequence) (repeat string)))
+  :group 'org-linear)
+
 (defvar org-linear-oauth-state nil
   "CSRF-prevention state used during OAuth flow.")
 
@@ -635,13 +641,28 @@ Automatically refreshes token on 401 and retries once."
             (setq has-next nil))))
       results)))
 
+(defun org-linear--map-state-to-todo (state-name)
+  "Map Linear STATE-NAME to Org TODO keyword.
+Returns TODO keyword or nil if state should map to DONE."
+  (when state-name
+    (let ((normalized (upcase (replace-regexp-in-string "[^a-zA-Z0-9-]" "-" state-name))))
+      (cond
+       ((string-match-p "\\(DONE\\|COMPLETED?\\|CLOSED?\\|CANCELED?\\|CANCELLED\\)" normalized) "DONE")
+       ((string-match-p "IN[-_]?PROGRESS" normalized) "IN-PROGRESS")
+       ((string-match-p "IN[-_]?REVIEW" normalized) "IN-REVIEW")
+       ((string-match-p "BLOCKED?" normalized) "BLOCKED")
+       ((string-match-p "BACKLOG" normalized) "BACKLOG")
+       ((string-match-p "\\(TODO\\|OPEN\\|TRIAGE\\)" normalized) "TODO")
+       (t "TODO")))))
+
 (defun org-linear--issue->org-heading (issue)
-  "Return (HEADLINE . PROPERTIES) derived from ISSUE node."
+  "Return (TODO-KEYWORD HEADLINE . PROPERTIES) derived from ISSUE node."
   (let* ((id          (alist-get 'id issue))
          (identifier  (alist-get 'identifier issue))
          (title       (org-linear--string-or (alist-get 'title issue) "(no title)"))
          (url         (alist-get 'url issue))
          (state-name  (org-linear--alist-get-in '(state name) issue))
+         (todo-kw     (org-linear--map-state-to-todo state-name))
          (assignee    (or (org-linear--alist-get-in '(assignee displayName) issue)
                           (org-linear--alist-get-in '(assignee name) issue)
                           "—"))
@@ -653,11 +674,11 @@ Automatically refreshes token on 401 and retries once."
                   ("PRIORITY"   . ,(if priority (number-to-string priority) ""))
                   ("URL"        . ,(or url ""))
                   ("UPDATED"    . ,(format-time-string "%Y-%m-%d %H:%M")) )))
-    (cons headline props)))
+    (list todo-kw headline props)))
 
-(defun org-linear--insert-org-heading (headline props)
-  "Insert an Org subtree for HEADLINE with PROPS alist."
-  (insert (format "** %s :linear:\n" headline))
+(defun org-linear--insert-org-heading (todo-kw headline props)
+  "Insert an Org subtree for HEADLINE with TODO-KW and PROPS alist."
+  (insert (format "** %s %s :linear:\n" (or todo-kw "TODO") headline))
   (insert ":PROPERTIES:\n")
   (dolist (kv props)
     (insert (format ":%s: %s\n" (car kv) (cdr kv))))
@@ -686,8 +707,8 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
                       (or team-label choice)))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
-        (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading headline props)))
+        (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw headline props)))
       (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
 
 ;;;###autoload
@@ -717,8 +738,8 @@ Relies on a TEAM_ID property at the parent level."
        nil 'children)
       (let ((issues (org-linear--issues-for-team team-id)))
         (dolist (iss issues)
-          (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
-            (org-linear--insert-org-heading headline props)))
+          (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
+            (org-linear--insert-org-heading todo-kw headline props)))
         (message "Refreshed %d issues" (length issues))))))
 
 ;;;; Property validation and conversion for bidirectional sync
@@ -1052,9 +1073,49 @@ PROPERTY is the name of the property, NEW-VALUE is the new value."
 ;;;; Bidirectional sync commands
 
 ;;;###autoload
+(defun org-linear--map-todo-to-state (todo-kw team-id)
+  "Map Org TODO-KW to Linear state name for TEAM-ID.
+Returns the Linear state name that best matches the TODO keyword."
+  (when todo-kw
+    (let* ((states (org-linear--team-states team-id))
+           (normalized (upcase todo-kw)))
+      (cond
+       ((string= normalized "DONE")
+        ;; Find a "Done" or "Completed" state
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "\\(Done\\|Completed?\\|Closed?\\)" (car pair)))
+                            states))
+            "Done"))
+       ((string= normalized "IN-PROGRESS")
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "In Progress" (car pair)))
+                            states))
+            "In Progress"))
+       ((string= normalized "IN-REVIEW")
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "In Review" (car pair)))
+                            states))
+            "In Review"))
+       ((string= normalized "BLOCKED")
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "Blocked?" (car pair)))
+                            states))
+            "Blocked"))
+       ((string= normalized "BACKLOG")
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "Backlog" (car pair)))
+                            states))
+            "Backlog"))
+       ((string= normalized "TODO")
+        (or (car (cl-find-if (lambda (pair)
+                              (string-match-p "\\(Todo\\|Open\\|Triage\\)" (car pair)))
+                            states))
+            "Todo"))
+       (t nil)))))
+
 (defun org-linear-sync-to-linear ()
   "Sync current Org heading's properties to Linear.
-Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org."
+Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and title from Org."
   (interactive)
   (org-linear--assert-auth)
   (save-excursion
@@ -1062,6 +1123,7 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org.
     (let* ((linear-id (org-entry-get (point) "LINEAR_ID"))
            (org-title (org-linear--extract-title-from-heading
                        (org-linear--org-subtree-title)))
+           (todo-kw (org-get-todo-state))
            (org-state (org-entry-get (point) "STATE"))
            (org-assignee (org-entry-get (point) "ASSIGNEE"))
            (org-priority (org-entry-get (point) "PRIORITY")))
@@ -1084,10 +1146,14 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org.
 
         ;; Get team ID for validation
         (let* ((team-id (org-linear--get-team-id-for-issue linear-id))
+               ;; If TODO keyword exists and differs from STATE property, prefer TODO
+               (effective-state (if todo-kw
+                                   (org-linear--map-todo-to-state todo-kw team-id)
+                                 org-state))
                (assignee-id (org-linear--validate-assignee org-assignee team-id))
-               (state-id (org-linear--validate-state org-state team-id))
+               (state-id (org-linear--validate-state effective-state team-id))
                (priority (org-linear--validate-priority org-priority))
-               (has-changes (or org-title org-state org-assignee org-priority)))
+               (has-changes (or org-title effective-state org-assignee org-priority)))
 
           (unless team-id
             (user-error "Could not determine team for Linear issue %s" linear-id))
@@ -1108,7 +1174,12 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org.
                      (identifier (alist-get 'identifier updated-issue)))
 
                 ;; Update Org properties with confirmed Linear values
-                (when new-state (org-set-property "STATE" new-state))
+                (when new-state
+                  (org-set-property "STATE" new-state)
+                  ;; Update TODO keyword
+                  (let ((todo-kw (org-linear--map-state-to-todo new-state)))
+                    (when todo-kw
+                      (org-todo todo-kw))))
                 (org-set-property "ASSIGNEE" new-assignee)
                 (when new-priority
                   (org-set-property "PRIORITY" (number-to-string new-priority)))
@@ -1140,7 +1211,12 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, and title from Org.
              (identifier (alist-get 'identifier current-issue)))
 
         ;; Update Org properties with Linear values
-        (when linear-state (org-set-property "STATE" linear-state))
+        (when linear-state
+          (org-set-property "STATE" linear-state)
+          ;; Update TODO keyword
+          (let ((todo-kw (org-linear--map-state-to-todo linear-state)))
+            (when todo-kw
+              (org-todo todo-kw))))
         (org-set-property "ASSIGNEE" linear-assignee)
         (when linear-priority
           (org-set-property "PRIORITY" (number-to-string linear-priority)))
@@ -1299,8 +1375,8 @@ Processes all child headings with LINEAR_ID properties."
         (unless (bolp) (insert "\n")))
       (insert (format "* Linear Issues assigned to me\n"))
       (dolist (iss issues)
-        (pcase-let* ((`(,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading headline props)))
+        (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw headline props)))
       (message "Inserted %d issues assigned to current user" (length issues)))))
 
 (provide 'org-linear)
