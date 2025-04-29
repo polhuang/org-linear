@@ -298,7 +298,7 @@ Returns t on success, nil on failure."
   (org-linear-auth-clear))
 
 (defun org-linear-auth--read-client-credentials ()
-  "Read client credentials from environment or auth-source.
+d  "Read client credentials from environment or auth-source.
 Returns (client-id . client-secret) or signals error."
   (let ((id (or (getenv "LINEAR_CLIENT_ID")
                 ;; Fallback to deprecated defcustom for backward compatibility
@@ -813,49 +813,71 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
       (user-error "No URL property on this heading"))))
 
 ;;;###autoload
-(defun org-linear-refresh-under-heading ()
-  "Re-sync issues for the team of the current parent heading, replacing `**` entries.
-Relies on a TEAM_ID property at the parent level."
-  (interactive)
-  (save-excursion
-    (org-back-to-heading t)
-    (let* ((parent (point))
-           (team-id (org-entry-get parent "TEAM_ID")))
-      (unless team-id
-        (user-error "No TEAM_ID on this heading; re-run `org-linear-insert-issues-for-team`"))
-      (org-map-entries
-       (lambda ()
-         (when (= (org-current-level) 2)
-           (org-cut-subtree)))
-       nil 'children)
-      (let ((issues (org-linear--issues-for-team team-id)))
-        (dolist (iss issues)
-          (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
-            (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
-        (message "Refreshed %d issues" (length issues))))))
-
-;;;###autoload
-(defun org-linear-refresh-file ()
-  "Re-sync issues for the team file, replacing all `*` level entries.
-Relies on file-level #+PROPERTY: TEAM_ID."
+(defun org-linear-sync-file-to-linear ()
+  "Sync all Linear issues in current file to Linear.
+Pushes all top-level headings with LINEAR_ID properties to Linear."
   (interactive)
   (org-linear--assert-auth)
-  (let ((team-id (org-entry-get-with-inheritance "TEAM_ID")))
-    (unless team-id
-      (user-error "No TEAM_ID file property found"))
-    ;; Delete all top-level headings
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward "^\\* " nil t)
-        (org-back-to-heading t)
-        (org-cut-subtree)))
-    ;; Re-insert all issues
-    (let ((issues (org-linear--issues-for-team team-id)))
-      (goto-char (point-max))
-      (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
-      (message "Refreshed %d issues" (length issues)))))
+  (let ((synced-count 0)
+        (error-count 0))
+    (org-map-entries
+     (lambda ()
+       (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
+         (when linear-id
+           (condition-case err
+               (progn
+                 (org-linear-sync-to-linear)
+                 (cl-incf synced-count))
+             (error
+              (cl-incf error-count)
+              (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
+     "LEVEL=1")
+    (message "Synced %d issues to Linear (%d errors)" synced-count error-count)))
+
+;;;###autoload
+(defun org-linear-sync-file-from-linear (&optional destructive)
+  "Sync all Linear issues in current file from Linear.
+Updates all top-level headings with LINEAR_ID properties.
+
+With prefix argument DESTRUCTIVE (or when called with C-u), deletes all
+top-level headings and re-imports fresh from Linear (requires file-level
+#+PROPERTY: TEAM_ID)."
+  (interactive "P")
+  (org-linear--assert-auth)
+  (if destructive
+      ;; Destructive mode: delete and re-import
+      (let ((team-id (org-entry-get-with-inheritance "TEAM_ID")))
+        (unless team-id
+          (user-error "No TEAM_ID file property found"))
+        ;; Delete all top-level headings
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward "^\\* " nil t)
+            (org-back-to-heading t)
+            (org-cut-subtree)))
+        ;; Re-insert all issues
+        (let ((issues (org-linear--issues-for-team team-id)))
+          (goto-char (point-max))
+          (dolist (iss issues)
+            (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
+              (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
+          (message "Re-imported %d issues from Linear" (length issues))))
+    ;; Normal mode: sync existing issues
+    (let ((synced-count 0)
+          (error-count 0))
+      (org-map-entries
+       (lambda ()
+         (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
+           (when linear-id
+             (condition-case err
+                 (progn
+                   (org-linear-sync-from-linear)
+                   (cl-incf synced-count))
+               (error
+                (cl-incf error-count)
+                (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
+       "LEVEL=1")
+      (message "Synced %d issues from Linear (%d errors)" synced-count error-count))))
 
 ;;;; Property validation and conversion for bidirectional sync
 
@@ -921,6 +943,38 @@ Returns list of label IDs that exist in the team, ignoring unknown labels."
                  (puthash "id" linear-id h) h))
          (data (org-linear--graphql q vars)))
     (org-linear--alist-get-in '(issue team id) data)))
+
+;;;; Delete issue
+
+;;;###autoload
+(defun org-linear-delete-issue ()
+  "Delete the Linear issue at point both in Linear and locally.
+Prompts for confirmation before deleting."
+  (interactive)
+  (org-linear--assert-auth)
+  (let ((linear-id (org-entry-get (point) "LINEAR_ID"))
+        (identifier (org-entry-get (point) "IDENTIFIER")))
+    (unless linear-id
+      (user-error "No LINEAR_ID property on this heading"))
+
+    (when (yes-or-no-p (format "Delete Linear issue %s? This cannot be undone. "
+                               (or identifier linear-id)))
+      (let* ((mutation "mutation($id: String!) {
+                         issueDelete(id: $id) {
+                           success
+                         }
+                       }")
+             (vars (let ((h (make-hash-table :test 'equal)))
+                     (puthash "id" linear-id h)
+                     h))
+             (data (org-linear--graphql mutation vars))
+             (success (org-linear--alist-get-in '(issueDelete success) data)))
+
+        (if success
+            (progn
+              (org-cut-subtree)
+              (message "Deleted issue %s" (or identifier linear-id)))
+          (user-error "Failed to delete issue"))))))
 
 ;;;; Create issue from Org subtree
 
@@ -1086,18 +1140,6 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
 
 ;;;; Configuration for bidirectional sync
 
-(defcustom org-linear-auto-sync t
-  "Whether to automatically sync Org property changes to Linear.
-When enabled, changes to STATE, ASSIGNEE, and PRIORITY properties
-will automatically sync to Linear."
-  :type 'boolean
-  :group 'org-linear)
-
-(defcustom org-linear-auto-sync-properties '("STATE" "ASSIGNEE" "PRIORITY")
-  "List of properties that trigger automatic sync when changed."
-  :type '(repeat string)
-  :group 'org-linear)
-
 (defcustom org-linear-conflict-resolution 'prompt
   "How to handle sync conflicts.
 'prompt - Ask user what to do
@@ -1175,31 +1217,6 @@ Returns alist of (property . resolved-value) pairs."
                    (if (string-prefix-p "Org:" choice) org-val linear-val))))))
         (push `(,property . ,resolved-val) resolutions)))
     resolutions))
-
-;;;; Automatic sync hooks
-
-(defvar org-linear--sync-in-progress nil
-  "Flag to prevent recursive sync calls.")
-
-(defun org-linear--property-changed-hook (property new-value)
-  "Hook function called when an Org property changes.
-PROPERTY is the name of the property, NEW-VALUE is the new value."
-  (when (and org-linear-auto-sync
-             (not org-linear--sync-in-progress)
-             (member property org-linear-auto-sync-properties))
-    ;; Check if we're in a heading with a LINEAR_ID
-    (when (org-entry-get (point) "LINEAR_ID")
-      (condition-case err
-          (progn
-            (setq org-linear--sync-in-progress t)
-            (org-linear-sync-to-linear)
-            (setq org-linear--sync-in-progress nil))
-        (error
-         (setq org-linear--sync-in-progress nil)
-         (message "Auto-sync failed: %s" (error-message-string err)))))))
-
-;; Add our hook to org-property-changed-functions
-(add-hook 'org-property-changed-functions #'org-linear--property-changed-hook)
 
 ;;;; Bidirectional sync commands
 
@@ -1420,28 +1437,50 @@ Processes all child headings with LINEAR_ID properties."
       (message "Synced %d issues to Linear (%d errors)" synced-count error-count))))
 
 ;;;###autoload
-(defun org-linear-sync-subtree-from-linear ()
+(defun org-linear-sync-subtree-from-linear (&optional destructive)
   "Sync all Linear issues under current heading from Linear.
-Processes all child headings with LINEAR_ID properties."
-  (interactive)
+Processes all child headings with LINEAR_ID properties.
+
+With prefix argument DESTRUCTIVE (or when called with C-u), deletes all
+child headings and re-imports fresh from Linear (requires TEAM_ID property)."
+  (interactive "P")
   (org-linear--assert-auth)
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((synced-count 0)
-          (error-count 0))
-      (org-map-entries
-       (lambda ()
-         (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
-           (when linear-id
-             (condition-case err
-                 (progn
-                   (org-linear-sync-from-linear)
-                   (cl-incf synced-count))
-               (error
-                (cl-incf error-count)
-                (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
-       nil 'tree)
-      (message "Synced %d issues from Linear (%d errors)" synced-count error-count))))
+  (if destructive
+      ;; Destructive mode: delete and re-import
+      (save-excursion
+        (org-back-to-heading t)
+        (let* ((parent (point))
+               (team-id (org-entry-get parent "TEAM_ID")))
+          (unless team-id
+            (user-error "No TEAM_ID on this heading; re-run `org-linear-insert-issues-for-team`"))
+          (org-map-entries
+           (lambda ()
+             (when (= (org-current-level) 2)
+               (org-cut-subtree)))
+           nil 'children)
+          (let ((issues (org-linear--issues-for-team team-id)))
+            (dolist (iss issues)
+              (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline ,props) (org-linear--issue->org-heading iss)))
+                (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
+            (message "Re-imported %d issues from Linear" (length issues)))))
+    ;; Normal mode: sync existing issues
+    (save-excursion
+      (org-back-to-heading t)
+      (let ((synced-count 0)
+            (error-count 0))
+        (org-map-entries
+         (lambda ()
+           (let ((linear-id (org-entry-get (point) "LINEAR_ID")))
+             (when linear-id
+               (condition-case err
+                   (progn
+                     (org-linear-sync-from-linear)
+                     (cl-incf synced-count))
+                 (error
+                  (cl-incf error-count)
+                  (message "Error syncing %s: %s" linear-id (error-message-string err)))))))
+         nil 'tree)
+        (message "Synced %d issues from Linear (%d errors)" synced-count error-count)))))
 
 ;;;; Minor mode & keymap
 
@@ -1450,12 +1489,15 @@ Processes all child headings with LINEAR_ID properties."
     ;; Original commands
     (define-key m (kbd "C-c l i") #'org-linear-insert-issues-for-team)
     (define-key m (kbd "C-c l o") #'org-linear-open-at-point)
-    (define-key m (kbd "C-c l r") #'org-linear-refresh-under-heading)
     (define-key m (kbd "C-c l c") #'org-linear-create-issue-from-subtree)
+    (define-key m (kbd "C-c l d") #'org-linear-delete-issue)
     ;; Bidirectional sync commands
     (define-key m (kbd "C-c l s") #'org-linear-sync-to-linear)
     (define-key m (kbd "C-c l p") #'org-linear-sync-from-linear)
     (define-key m (kbd "C-c l S") #'org-linear-sync-subtree-to-linear)
+    (define-key m (kbd "C-c l P") #'org-linear-sync-subtree-from-linear)
+    (define-key m (kbd "C-c l f") #'org-linear-sync-file-to-linear)
+    (define-key m (kbd "C-c l F") #'org-linear-sync-file-from-linear)
     (define-key m (kbd "C-c l ?") #'org-linear-sync-status)
     ;; User issues
     (define-key m (kbd "C-c l u") #'org-linear-insert-issues-for-current-user)
