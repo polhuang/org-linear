@@ -75,10 +75,17 @@
   :type 'integer
   :group 'org-linear)
 
-(defcustom org-linear-todo-keywords
-  '((sequence "TODO" "IN-PROGRESS" "IN-REVIEW" "BACKLOG" "BLOCKED" "|" "DONE"))
-  "TODO keywords for Linear issues in Org mode."
-  :type '(list (cons (const sequence) (repeat string)))
+(defcustom org-linear-state-alist
+  '(("TODO" . "Todo")
+    ("IN-PROGRESS" . "In Progress")
+    ("IN-REVIEW" . "In Review")
+    ("BACKLOG" . "Backlog")
+    ("BLOCKED" . "Blocked")
+    ("DONE" . "Done"))
+  "Alist mapping Org TODO keywords to Linear state names.
+Each entry is (ORG-TODO-KEYWORD . LINEAR-STATE-NAME).
+The mapping is bidirectional: syncing uses this to convert between Org and Linear states."
+  :type '(alist :key-type string :value-type string)
   :group 'org-linear)
 
 (defvar org-linear-oauth-state nil
@@ -642,18 +649,17 @@ Automatically refreshes token on 401 and retries once."
       results)))
 
 (defun org-linear--map-state-to-todo (state-name)
-  "Map Linear STATE-NAME to Org TODO keyword.
-Returns TODO keyword or nil if state should map to DONE."
+  "Map Linear STATE-NAME to Org TODO keyword using `org-linear-state-alist'.
+Returns TODO keyword or nil if no mapping found."
   (when state-name
-    (let ((normalized (upcase (replace-regexp-in-string "[^a-zA-Z0-9-]" "-" state-name))))
-      (cond
-       ((string-match-p "\\(DONE\\|COMPLETED?\\|CLOSED?\\|CANCELED?\\|CANCELLED\\)" normalized) "DONE")
-       ((string-match-p "IN[-_]?PROGRESS" normalized) "IN-PROGRESS")
-       ((string-match-p "IN[-_]?REVIEW" normalized) "IN-REVIEW")
-       ((string-match-p "BLOCKED?" normalized) "BLOCKED")
-       ((string-match-p "BACKLOG" normalized) "BACKLOG")
-       ((string-match-p "\\(TODO\\|OPEN\\|TRIAGE\\)" normalized) "TODO")
-       (t "TODO")))))
+    ;; First try exact match
+    (or (car (rassoc state-name org-linear-state-alist))
+        ;; Then try case-insensitive fuzzy match
+        (car (cl-find-if (lambda (pair)
+                          (string-equal-ignore-case (cdr pair) state-name))
+                        org-linear-state-alist))
+        ;; Fallback to TODO
+        "TODO")))
 
 (defun org-linear--issue->org-heading (issue)
   "Return (TODO-KEYWORD HEADLINE . PROPERTIES) derived from ISSUE node."
@@ -1074,44 +1080,19 @@ PROPERTY is the name of the property, NEW-VALUE is the new value."
 
 ;;;###autoload
 (defun org-linear--map-todo-to-state (todo-kw team-id)
-  "Map Org TODO-KW to Linear state name for TEAM-ID.
-Returns the Linear state name that best matches the TODO keyword."
+  "Map Org TODO-KW to Linear state name using `org-linear-state-alist'.
+TEAM-ID is used to verify the state exists in the team.
+Returns the Linear state name or nil if no mapping found."
   (when todo-kw
-    (let* ((states (org-linear--team-states team-id))
-           (normalized (upcase todo-kw)))
-      (cond
-       ((string= normalized "DONE")
-        ;; Find a "Done" or "Completed" state
+    (let* ((linear-state (cdr (assoc todo-kw org-linear-state-alist)))
+           (states (org-linear--team-states team-id)))
+      ;; Verify the mapped state exists in the team's available states
+      (when linear-state
         (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "\\(Done\\|Completed?\\|Closed?\\)" (car pair)))
+                              (string-equal-ignore-case (car pair) linear-state))
                             states))
-            "Done"))
-       ((string= normalized "IN-PROGRESS")
-        (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "In Progress" (car pair)))
-                            states))
-            "In Progress"))
-       ((string= normalized "IN-REVIEW")
-        (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "In Review" (car pair)))
-                            states))
-            "In Review"))
-       ((string= normalized "BLOCKED")
-        (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "Blocked?" (car pair)))
-                            states))
-            "Blocked"))
-       ((string= normalized "BACKLOG")
-        (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "Backlog" (car pair)))
-                            states))
-            "Backlog"))
-       ((string= normalized "TODO")
-        (or (car (cl-find-if (lambda (pair)
-                              (string-match-p "\\(Todo\\|Open\\|Triage\\)" (car pair)))
-                            states))
-            "Todo"))
-       (t nil)))))
+            ;; If exact match not found, return the mapped value anyway
+            linear-state)))))
 
 (defun org-linear-sync-to-linear ()
   "Sync current Org heading's properties to Linear.
