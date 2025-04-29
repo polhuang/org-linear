@@ -88,6 +88,18 @@ The mapping is bidirectional: syncing uses this to convert between Org and Linea
   :type '(alist :key-type string :value-type string)
   :group 'org-linear)
 
+(defcustom org-linear-priority-alist
+  '((?A . 1)
+    (?B . 2)
+    (?C . 3)
+    (?D . 4))
+  "Alist mapping Org priority characters to Linear priority numbers.
+Each entry is (ORG-PRIORITY-CHAR . LINEAR-PRIORITY-NUMBER).
+Linear priorities: 0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low.
+The mapping is bidirectional: syncing uses this to convert between Org and Linear priorities."
+  :type '(alist :key-type character :value-type integer)
+  :group 'org-linear)
+
 (defvar org-linear-oauth-state nil
   "CSRF-prevention state used during OAuth flow.")
 
@@ -661,8 +673,20 @@ Returns TODO keyword or nil if no mapping found."
         ;; Fallback to TODO
         "TODO")))
 
+(defun org-linear--map-priority-to-org (linear-priority)
+  "Map Linear priority number to Org priority character using `org-linear-priority-alist'.
+Returns Org priority character or nil if no mapping found."
+  (when linear-priority
+    (car (rassoc linear-priority org-linear-priority-alist))))
+
+(defun org-linear--map-org-to-priority (org-priority-char)
+  "Map Org priority character to Linear priority number using `org-linear-priority-alist'.
+Returns Linear priority number or nil if no mapping found."
+  (when org-priority-char
+    (cdr (assoc org-priority-char org-linear-priority-alist))))
+
 (defun org-linear--issue->org-heading (issue)
-  "Return (TODO-KEYWORD HEADLINE . PROPERTIES) derived from ISSUE node."
+  "Return (TODO-KEYWORD ORG-PRIORITY HEADLINE . PROPERTIES) derived from ISSUE node."
   (let* ((id          (alist-get 'id issue))
          (identifier  (alist-get 'identifier issue))
          (title       (org-linear--string-or (alist-get 'title issue) "(no title)"))
@@ -672,19 +696,21 @@ Returns TODO keyword or nil if no mapping found."
          (assignee    (or (org-linear--alist-get-in '(assignee displayName) issue)
                           (org-linear--alist-get-in '(assignee name) issue)
                           "—"))
-         (priority    (alist-get 'priority issue))
+         (linear-priority (alist-get 'priority issue))
+         (org-priority    (org-linear--map-priority-to-org linear-priority))
          (headline    (format "[%s] %s" identifier title))
          (props `(("LINEAR_ID"  . ,id)
                   ("STATE"      . ,(or state-name ""))
                   ("ASSIGNEE"   . ,assignee)
-                  ("PRIORITY"   . ,(if priority (number-to-string priority) ""))
+                  ("PRIORITY"   . ,(if linear-priority (number-to-string linear-priority) ""))
                   ("URL"        . ,(or url ""))
                   ("UPDATED"    . ,(format-time-string "%Y-%m-%d %H:%M")) )))
-    (list todo-kw headline props)))
+    (list todo-kw org-priority headline props)))
 
-(defun org-linear--insert-org-heading (todo-kw headline props)
-  "Insert an Org subtree for HEADLINE with TODO-KW and PROPS alist."
-  (insert (format "** %s %s :linear:\n" (or todo-kw "TODO") headline))
+(defun org-linear--insert-org-heading (todo-kw org-priority headline props)
+  "Insert an Org subtree for HEADLINE with TODO-KW, ORG-PRIORITY and PROPS alist."
+  (let ((priority-str (if org-priority (format " [#%c]" org-priority) "")))
+    (insert (format "** %s%s %s :linear:\n" (or todo-kw "TODO") priority-str headline)))
   (insert ":PROPERTIES:\n")
   (dolist (kv props)
     (insert (format ":%s: %s\n" (car kv) (cdr kv))))
@@ -713,8 +739,8 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
                       (or team-label choice)))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading todo-kw headline props)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw org-priority headline props)))
       (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
 
 ;;;###autoload
@@ -744,8 +770,8 @@ Relies on a TEAM_ID property at the parent level."
        nil 'children)
       (let ((issues (org-linear--issues-for-team team-id)))
         (dolist (iss issues)
-          (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
-            (org-linear--insert-org-heading todo-kw headline props)))
+          (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
+            (org-linear--insert-org-heading todo-kw org-priority headline props)))
         (message "Refreshed %d issues" (length issues))))))
 
 ;;;; Property validation and conversion for bidirectional sync
@@ -1105,15 +1131,16 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
            (org-title (org-linear--extract-title-from-heading
                        (org-linear--org-subtree-title)))
            (todo-kw (org-get-todo-state))
+           (org-priority-char (nth 3 (org-heading-components)))  ; Get priority character from heading
            (org-state (org-entry-get (point) "STATE"))
            (org-assignee (org-entry-get (point) "ASSIGNEE"))
-           (org-priority (org-entry-get (point) "PRIORITY")))
+           (org-priority-prop (org-entry-get (point) "PRIORITY")))
 
       (unless linear-id
         (user-error "No LINEAR_ID property on this heading"))
 
       ;; Check for conflicts before syncing
-      (let* ((conflicts (org-linear--detect-conflicts linear-id org-state org-assignee org-priority)))
+      (let* ((conflicts (org-linear--detect-conflicts linear-id org-state org-assignee org-priority-prop)))
         (when conflicts
           (let ((resolutions (org-linear--resolve-conflicts conflicts)))
             ;; Apply resolved values back to Org properties
@@ -1123,7 +1150,7 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                 (pcase property
                   ('state (setq org-state value))
                   ('assignee (setq org-assignee value))
-                  ('priority (setq org-priority value)))))))
+                  ('priority (setq org-priority-prop value)))))))
 
         ;; Get team ID for validation
         (let* ((team-id (org-linear--get-team-id-for-issue linear-id))
@@ -1131,10 +1158,14 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                (effective-state (if todo-kw
                                    (org-linear--map-todo-to-state todo-kw team-id)
                                  org-state))
+               ;; If org priority character exists, map it to Linear priority
+               (effective-priority (if org-priority-char
+                                      (number-to-string (org-linear--map-org-to-priority org-priority-char))
+                                    org-priority-prop))
                (assignee-id (org-linear--validate-assignee org-assignee team-id))
                (state-id (org-linear--validate-state effective-state team-id))
-               (priority (org-linear--validate-priority org-priority))
-               (has-changes (or org-title effective-state org-assignee org-priority)))
+               (priority (org-linear--validate-priority effective-priority))
+               (has-changes (or org-title effective-state org-assignee effective-priority)))
 
           (unless team-id
             (user-error "Could not determine team for Linear issue %s" linear-id))
@@ -1163,7 +1194,11 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                       (org-todo todo-kw))))
                 (org-set-property "ASSIGNEE" new-assignee)
                 (when new-priority
-                  (org-set-property "PRIORITY" (number-to-string new-priority)))
+                  (org-set-property "PRIORITY" (number-to-string new-priority))
+                  ;; Update Org priority in heading
+                  (let ((org-priority-char (org-linear--map-priority-to-org new-priority)))
+                    (when org-priority-char
+                      (org-priority org-priority-char))))
 
                 ;; Add sync timestamp
                 (org-set-property "LINEAR_LAST_SYNC"
@@ -1200,7 +1235,11 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
               (org-todo todo-kw))))
         (org-set-property "ASSIGNEE" linear-assignee)
         (when linear-priority
-          (org-set-property "PRIORITY" (number-to-string linear-priority)))
+          (org-set-property "PRIORITY" (number-to-string linear-priority))
+          ;; Update Org priority in heading
+          (let ((org-priority-char (org-linear--map-priority-to-org linear-priority)))
+            (when org-priority-char
+              (org-priority org-priority-char))))
         (org-set-property "LINEAR_LAST_SYNC"
                          (format-time-string "%Y-%m-%d %H:%M:%S"))
 
@@ -1356,8 +1395,8 @@ Processes all child headings with LINEAR_ID properties."
         (unless (bolp) (insert "\n")))
       (insert (format "* Linear Issues assigned to me\n"))
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading todo-kw headline props)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw org-priority headline props)))
       (message "Inserted %d issues assigned to current user" (length issues)))))
 
 (provide 'org-linear)
