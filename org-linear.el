@@ -50,11 +50,6 @@
   :type 'string
   :group 'org-linear)
 
-(defcustom org-linear-workspace-id ""
-  "Workspace ID for Linear (not required for authenticated queries)."
-  :type 'string
-  :group 'org-linear)
-
 (defcustom org-linear-client-id ""
   "Client ID for Linear OAuth2 application."
   :type 'string
@@ -324,7 +319,7 @@ Returns (client-id . client-secret) or signals error."
     (unless (and id secret 
                  (> (length (string-trim id)) 0) 
                  (> (length (string-trim secret)) 0))
-      (user-error "Linear client credentials not found. Set LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET environment variables, configure via auth-source, or set org-linear-client-id/org-linear-client-secret (deprecated)"))
+      (user-error "Linear client credentials not found. Set LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET environment variables, configure via auth-source, or set org-linear-client-id/org-linear-client-secret"))
     (cons (string-trim id) (string-trim secret))))
 
 (defun org-linear-auth--base64url-encode (data)
@@ -589,6 +584,16 @@ Automatically refreshes token on 401 and retries once."
                 (cons (format "%s (%s)" nm tp) id)))
             (append nodes nil))))
 
+(defun org-linear--team-labels (team-id)
+  "Return ((NAME . ID) ...) for labels of TEAM-ID."
+  (let* ((q "query($id: ID!) { team(id:$id){ labels(first:100){ nodes { id name } } } }")
+         (vars (let ((h (make-hash-table :test 'equal))) (puthash "id" team-id h) h))
+         (data (org-linear--graphql q vars))
+         (nodes (org-linear--alist-get-in '(team labels nodes) data)))
+    (mapcar (lambda (node)
+              (cons (alist-get 'name node) (alist-get 'id node)))
+            (append nodes nil))))
+
 ;;;; Workspace users (assignees)
 
 (defun org-linear--users (&optional n)
@@ -632,6 +637,7 @@ Automatically refreshes token on 401 and retries once."
                 state { id name type }
                 priority
                 assignee { id name displayName }
+                labels { nodes { id name color } }
                 createdAt updatedAt
               }
             }
@@ -685,8 +691,21 @@ Returns Linear priority number or nil if no mapping found."
   (when org-priority-char
     (cdr (assoc org-priority-char org-linear-priority-alist))))
 
+(defun org-linear--labels-to-tags (labels-data)
+  "Convert Linear LABELS-DATA to list of Org tag strings.
+LABELS-DATA is the labels field from Linear API: { nodes: [...] }"
+  (when labels-data
+    (let* ((nodes (alist-get 'nodes labels-data))
+           (label-names (mapcar (lambda (label)
+                                 (alist-get 'name label))
+                               nodes)))
+      ;; Convert label names to valid Org tags (replace spaces/special chars with underscores)
+      (mapcar (lambda (name)
+               (replace-regexp-in-string "[^[:alnum:]_@#%]+" "_" name))
+             label-names))))
+
 (defun org-linear--issue->org-heading (issue)
-  "Return (TODO-KEYWORD ORG-PRIORITY HEADLINE . PROPERTIES) derived from ISSUE node."
+  "Return (TODO-KEYWORD ORG-PRIORITY TAGS HEADLINE . PROPERTIES) derived from ISSUE node."
   (let* ((id          (alist-get 'id issue))
          (identifier  (alist-get 'identifier issue))
          (title       (org-linear--string-or (alist-get 'title issue) "(no title)"))
@@ -698,19 +717,32 @@ Returns Linear priority number or nil if no mapping found."
                           "—"))
          (linear-priority (alist-get 'priority issue))
          (org-priority    (org-linear--map-priority-to-org linear-priority))
+         (labels      (alist-get 'labels issue))
+         (tags        (org-linear--labels-to-tags labels))
+         ;; Store labels as comma-separated list of label names
+         (labels-str  (when labels
+                       (let ((nodes (alist-get 'nodes labels)))
+                         (mapconcat (lambda (label) (alist-get 'name label))
+                                   nodes
+                                   ", "))))
          (headline    (format "[%s] %s" identifier title))
          (props `(("LINEAR_ID"  . ,id)
                   ("STATE"      . ,(or state-name ""))
                   ("ASSIGNEE"   . ,assignee)
                   ("PRIORITY"   . ,(if linear-priority (number-to-string linear-priority) ""))
+                  ("LABELS"     . ,(or labels-str ""))
                   ("URL"        . ,(or url ""))
                   ("UPDATED"    . ,(format-time-string "%Y-%m-%d %H:%M")) )))
-    (list todo-kw org-priority headline props)))
+    (list todo-kw org-priority tags headline props)))
 
-(defun org-linear--insert-org-heading (todo-kw org-priority headline props)
-  "Insert an Org subtree for HEADLINE with TODO-KW, ORG-PRIORITY and PROPS alist."
-  (let ((priority-str (if org-priority (format " [#%c]" org-priority) "")))
-    (insert (format "** %s%s %s :linear:\n" (or todo-kw "TODO") priority-str headline)))
+(defun org-linear--insert-org-heading (todo-kw org-priority tags headline props)
+  "Insert an Org subtree for HEADLINE with TODO-KW, ORG-PRIORITY, TAGS and PROPS alist."
+  (let ((priority-str (if org-priority (format " [#%c]" org-priority) ""))
+        (all-tags (if tags
+                     (append tags '("linear"))
+                   '("linear")))
+        (tags-str (mapconcat 'identity all-tags ":")))
+    (insert (format "** %s%s %s :%s:\n" (or todo-kw "TODO") priority-str headline tags-str)))
   (insert ":PROPERTIES:\n")
   (dolist (kv props)
     (insert (format ":%s: %s\n" (car kv) (cdr kv))))
@@ -739,8 +771,8 @@ Each issue becomes a `**` heading with useful PROPERTIES and a clickable URL."
                       (or team-label choice)))
       (org-set-property "TEAM_ID" choice)
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading todo-kw org-priority headline props)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
       (message "Inserted %d issues for team %s" (length issues) (or team-label choice)))))
 
 ;;;###autoload
@@ -770,8 +802,8 @@ Relies on a TEAM_ID property at the parent level."
        nil 'children)
       (let ((issues (org-linear--issues-for-team team-id)))
         (dolist (iss issues)
-          (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
-            (org-linear--insert-org-heading todo-kw org-priority headline props)))
+          (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+            (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
         (message "Refreshed %d issues" (length issues))))))
 
 ;;;; Property validation and conversion for bidirectional sync
@@ -807,6 +839,18 @@ Relies on a TEAM_ID property at the parent level."
              (not (string-empty-p (string-trim priority-str)))
              (string-match-p "^[0-4]$" (string-trim priority-str)))
     (string-to-number (string-trim priority-str))))
+
+(defun org-linear--validate-labels (labels-str team-id)
+  "Convert comma-separated LABELS-STR to list of label IDs for TEAM-ID.
+Returns list of label IDs that exist in the team, ignoring unknown labels."
+  (when (and labels-str (not (string-empty-p (string-trim labels-str))))
+    (let* ((label-names (mapcar #'string-trim
+                               (split-string labels-str "," t)))
+           (team-labels (org-linear--team-labels team-id)))
+      (delq nil
+            (mapcar (lambda (name)
+                     (cdr (assoc name team-labels)))
+                   label-names)))))
 
 (defun org-linear--extract-title-from-heading (heading)
   "Extract clean title from Org HEADING, removing [IDENTIFIER] prefix if present."
@@ -891,7 +935,8 @@ Relies on a TEAM_ID property at the parent level."
                  issue{ id identifier url
                         state{ id name }
                         assignee{ id name displayName }
-                        priority }
+                        priority
+                        labels { nodes { id name color } } }
                }
              }")
          (in (let ((h (make-hash-table :test 'equal)))
@@ -909,7 +954,7 @@ Relies on a TEAM_ID property at the parent level."
     (unless node (error "Linear returned no issue node"))
     node))
 
-(defun org-linear--issue-update (issue-id &optional title description assignee-id state-id priority)
+(defun org-linear--issue-update (issue-id &optional title description assignee-id state-id priority label-ids)
   "Update a Linear issue; return alist with updated issue data (or signal error)."
   (let* ((q "mutation($id: String!, $input: IssueUpdateInput!){
                issueUpdate(id: $id, input: $input){
@@ -917,7 +962,8 @@ Relies on a TEAM_ID property at the parent level."
                  issue{ id identifier url title
                         state{ id name type }
                         assignee{ id name displayName }
-                        priority priorityLabel }
+                        priority priorityLabel
+                        labels { nodes { id name color } } }
                }
              }")
          (in (let ((h (make-hash-table :test 'equal)))
@@ -928,6 +974,7 @@ Relies on a TEAM_ID property at the parent level."
                (when assignee-id (puthash "assigneeId" assignee-id h))
                (when state-id    (puthash "stateId" state-id h))
                (when priority    (puthash "priority" priority h))
+               (when label-ids   (puthash "labelIds" (vconcat label-ids) h))
                h))
          (vars (let ((h (make-hash-table :test 'equal)))
                  (puthash "id" issue-id h)
@@ -1020,6 +1067,7 @@ will automatically sync to Linear."
                  state { id name }
                  assignee { id name displayName }
                  priority
+                 labels { nodes { id name color } }
                }
              }")
          (vars (let ((h (make-hash-table :test 'equal)))
@@ -1134,7 +1182,8 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
            (org-priority-char (nth 3 (org-heading-components)))  ; Get priority character from heading
            (org-state (org-entry-get (point) "STATE"))
            (org-assignee (org-entry-get (point) "ASSIGNEE"))
-           (org-priority-prop (org-entry-get (point) "PRIORITY")))
+           (org-priority-prop (org-entry-get (point) "PRIORITY"))
+           (org-labels (org-entry-get (point) "LABELS")))
 
       (unless linear-id
         (user-error "No LINEAR_ID property on this heading"))
@@ -1165,7 +1214,8 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                (assignee-id (org-linear--validate-assignee org-assignee team-id))
                (state-id (org-linear--validate-state effective-state team-id))
                (priority (org-linear--validate-priority effective-priority))
-               (has-changes (or org-title effective-state org-assignee effective-priority)))
+               (label-ids (org-linear--validate-labels org-labels team-id))
+               (has-changes (or org-title effective-state org-assignee effective-priority org-labels)))
 
           (unless team-id
             (user-error "Could not determine team for Linear issue %s" linear-id))
@@ -1177,12 +1227,19 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                                     nil ; description - not syncing body for now
                                     assignee-id
                                     state-id
-                                    priority))
+                                    priority
+                                    label-ids))
                      (new-state (org-linear--alist-get-in '(state name) updated-issue))
                      (new-assignee (or (org-linear--alist-get-in '(assignee displayName) updated-issue)
                                       (org-linear--alist-get-in '(assignee name) updated-issue)
                                       "—"))
                      (new-priority (alist-get 'priority updated-issue))
+                     (new-labels (alist-get 'labels updated-issue))
+                     (new-labels-str (when new-labels
+                                      (let ((nodes (alist-get 'nodes new-labels)))
+                                        (mapconcat (lambda (label) (alist-get 'name label))
+                                                  nodes
+                                                  ", "))))
                      (identifier (alist-get 'identifier updated-issue)))
 
                 ;; Update Org properties with confirmed Linear values
@@ -1199,6 +1256,8 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                   (let ((org-priority-char (org-linear--map-priority-to-org new-priority)))
                     (when org-priority-char
                       (org-priority org-priority-char))))
+                (when new-labels-str
+                  (org-set-property "LABELS" new-labels-str))
 
                 ;; Add sync timestamp
                 (org-set-property "LINEAR_LAST_SYNC"
@@ -1224,6 +1283,12 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
                                  (org-linear--alist-get-in '(assignee name) current-issue)
                                  "—"))
              (linear-priority (alist-get 'priority current-issue))
+             (linear-labels (alist-get 'labels current-issue))
+             (linear-labels-str (when linear-labels
+                                 (let ((nodes (alist-get 'nodes linear-labels)))
+                                   (mapconcat (lambda (label) (alist-get 'name label))
+                                             nodes
+                                             ", "))))
              (identifier (alist-get 'identifier current-issue)))
 
         ;; Update Org properties with Linear values
@@ -1240,6 +1305,8 @@ Updates Linear issue with current STATE, ASSIGNEE, PRIORITY, TODO keyword, and t
           (let ((org-priority-char (org-linear--map-priority-to-org linear-priority)))
             (when org-priority-char
               (org-priority org-priority-char))))
+        (when linear-labels-str
+          (org-set-property "LABELS" linear-labels-str))
         (org-set-property "LINEAR_LAST_SYNC"
                          (format-time-string "%Y-%m-%d %H:%M:%S"))
 
@@ -1352,6 +1419,7 @@ Processes all child headings with LINEAR_ID properties."
                  state { id name type }
                  priority
                  assignee { id name displayName }
+                 labels { nodes { id name color } }
                  createdAt updatedAt
                }
              }
@@ -1395,8 +1463,8 @@ Processes all child headings with LINEAR_ID properties."
         (unless (bolp) (insert "\n")))
       (insert (format "* Linear Issues assigned to me\n"))
       (dolist (iss issues)
-        (pcase-let* ((`(,todo-kw ,org-priority ,headline . ,props) (org-linear--issue->org-heading iss)))
-          (org-linear--insert-org-heading todo-kw org-priority headline props)))
+        (pcase-let* ((`(,todo-kw ,org-priority ,tags ,headline . ,props) (org-linear--issue->org-heading iss)))
+          (org-linear--insert-org-heading todo-kw org-priority tags headline props)))
       (message "Inserted %d issues assigned to current user" (length issues)))))
 
 (provide 'org-linear)
