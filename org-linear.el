@@ -26,9 +26,14 @@
   :type 'string
   :group 'linear-org)
 
-(defcustom linear-oauth-redirect-uri "http://localhost"
+(defcustom linear-oauth-redirect-uri "http://localhost:8080/callback"
   "Redirect URI for Linear OAuth2 authentication."
   :type 'string
+  :group 'linear-org)
+
+(defcustom linear-issues-page-size 50
+  "How many issues to fetch per GraphQL page."
+  :type 'integer
   :group 'linear-org)
 
 (defcustom linear-graphql-endpoint "https://api.linear.app/graphql"
