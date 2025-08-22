@@ -124,5 +124,17 @@ Returns parsed JSON as an alist, or signals an error."
         (error "Linear GraphQL error: %s" message)))
     (alist-get 'data resp)))
 
+(defun linear--teams ()
+  "Return a list of teams as ((display . id) ...)."
+  (let* ((q "query { teams(first: 100) { nodes { id name key } } }")
+         (data (linear--graphql q))
+         (nodes (alist-get 'nodes (alist-get 'teams data))))
+    (mapcar (lambda (node)
+              (let ((id (alist-get 'id node))
+                    (name (alist-get 'name node))
+                    (key (alist-get 'key node)))
+                (cons (format "%s (%s)" name key) id)))
+            (append nodes nil))))
+
 (provide 'linear-org)
 ;;; linear-org.el ends here
