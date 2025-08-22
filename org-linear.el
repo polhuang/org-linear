@@ -31,6 +31,11 @@
   :type 'string
   :group 'linear-org)
 
+(defcustom linear-graphql-endpoint "https://api.linear.app/graphql"
+  "Linear GraphQL endpoint."
+  :type 'string
+  :group 'linear-org)
+
 
 ;;;###autoload
 (defun linear-oauth-authorize ()
