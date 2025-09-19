@@ -20,11 +20,21 @@
 ;;; Code:
 
 (require 'json)
-(require 'request)
 (require 'org)
 (require 'cl-lib)        ;; cl-function, cl-reduce
 (require 'subr-x)        ;; string-empty-p, string-trim
 (require 'simple-httpd)  ;; defservlet / httpd-start
+
+;; Try to load request library, fallback to url.el if not available
+(if (require 'request nil t)
+    (message "Using request.el for HTTP")
+  (error "The 'request' package is required. Install it with: M-x package-install RET request RET"))
+
+;; Load linear-auth from core/ subdirectory
+(let ((auth-file (expand-file-name "core/linear-auth.el" 
+                                   (file-name-directory (or load-file-name buffer-file-name)))))
+  (when (file-exists-p auth-file)
+    (load auth-file)))
 (require 'auth-source)   ;; secure authentication
 
 (defgroup org-linear nil
@@ -337,7 +347,7 @@ Returns (client-id . client-secret) or signals error."
                  (let ((access-token (alist-get 'access_token data))
                        (refresh-token (alist-get 'refresh_token data))
                        (expires-in (alist-get 'expires_in data)))
-                   (org-linear-auth--write-token access-token refresh-token expires-in)
+                   (linear-auth--write-token access-token refresh-token)
                    (setq org-linear-oauth-state nil
                          org-linear-oauth-pkce-verifier nil)
                    (message "Successfully authenticated with Linear!"))))
@@ -346,8 +356,10 @@ Returns (client-id . client-secret) or signals error."
                (let ((status (when response (request-response-status-code response)))
                      (data (when response 
                             (condition-case nil
-                                (with-current-buffer (request-response-buffer response)
-                                  (json-read-from-string (buffer-string)))
+                                (if (fboundp 'request-response-buffer)
+                                    (with-current-buffer (request-response-buffer response)
+                                      (json-read-from-string (buffer-string)))
+                                  (request-response-data response))
                               (error nil)))))
                  (message "Error exchanging code for token (HTTP %s): %S. Data: %S" 
                          status error-thrown data)))))))
@@ -355,12 +367,13 @@ Returns (client-id . client-secret) or signals error."
 ;;;; GraphQL core
 
 (defun org-linear--assert-auth ()
-  "Signal an error if no API key is present, return token if found."
-  (let ((token (or (org-linear-auth--read-token)
-                   (unless (string-empty-p (string-trim org-linear-api-key))
-                     org-linear-api-key))))
-    (unless (and token (> (length (string-trim token)) 0))
-      (user-error "No Linear API key found. Run `linear-oauth-authorize' or configure via auth-source"))
+  "Signal an error if no API key is present."
+  (let ((token (or (linear-auth--read-token)
+                   (and (stringp org-linear-api-key) 
+                        (> (length (string-trim org-linear-api-key)) 0)
+                        org-linear-api-key))))
+    (unless token
+      (user-error "No Linear API key found. Run `linear-oauth-authorize' or set `linear-api-key'"))
     token))
 
 (defun org-linear--alist-get-in (keys alist)
@@ -390,7 +403,9 @@ Returns parsed JSON as an alist, or signals an error with details."
      :error   (cl-function
                (lambda (&key error-thrown response &allow-other-keys)
                  (setq err error-thrown
-                       resp-buf (and response (request-response-buffer response))))))
+                       resp-buf (and response 
+                                   (fboundp 'request-response-buffer)
+                                   (request-response-buffer response))))))
     (when err
       (let ((raw (and resp-buf (with-current-buffer resp-buf (buffer-string)))))
         (error "Linear GraphQL request failed: %S\nRaw: %s" err (or raw ""))))
