@@ -11,8 +11,8 @@
 ;;
 ;; Quick start:
 ;;   (require 'org-linear)
-;;   M-x linear-oauth-callback-server     ;; http://localhost:8080/callback
-;;   M-x linear-oauth-authorize
+;;   M-x org-linear-oauth-callback-server     ;; http://localhost:8080/callback
+;;   M-x org-linear-oauth-authorize
 ;;   M-x org-linear-insert-issues-for-team
 ;;   (Optional) Turn on minor mode in Org buffers for keybindings:
 ;;     (add-hook 'org-mode-hook #'org-linear-mode)
@@ -25,68 +25,254 @@
 (require 'cl-lib)        ;; cl-function, cl-reduce
 (require 'subr-x)        ;; string-empty-p, string-trim
 (require 'simple-httpd)  ;; defservlet / httpd-start
+(require 'auth-source)   ;; secure authentication
 
 (defgroup org-linear nil
   "Integration with Linear."
   :group 'tools)
 
+(defgroup org-linear-auth nil
+  "Authentication settings for Linear integration."
+  :group 'org-linear)
+
 ;;;; Configuration
 
-(defcustom linear-graphql-endpoint "https://api.linear.app/graphql"
+(defcustom org-linear-graphql-endpoint "https://api.linear.app/graphql"
   "Linear GraphQL endpoint."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-api-key ""
+(defcustom org-linear-api-key ""
   "API key (OAuth access token) for accessing the Linear API."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-workspace-id ""
+(defcustom org-linear-workspace-id ""
   "Workspace ID for Linear (not required for authenticated queries)."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-client-id "195109b12876be343bad55f93cb30172"
+(defcustom org-linear-client-id "195109b12876be343bad55f93cb30172"
   "Client ID for Linear OAuth2 application."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-client-secret "d3ee010b6a76ff78a1e1cacaeb352356"
+(defcustom org-linear-client-secret "d3ee010b6a76ff78a1e1cacaeb352356"
   "Client secret for Linear OAuth2 application."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-oauth-redirect-uri "http://localhost:8080/callback"
+(defcustom org-linear-oauth-redirect-uri "http://localhost:8080/callback"
   "Redirect URI for Linear OAuth2 authentication (must match app settings)."
   :type 'string
   :group 'org-linear)
 
-(defcustom linear-issues-page-size 50
+(defcustom org-linear-issues-page-size 50
   "How many issues to fetch per GraphQL page."
   :type 'integer
   :group 'org-linear)
 
-(defvar linear-oauth-state nil
+(defvar org-linear-oauth-state nil
   "CSRF-prevention state used during OAuth flow.")
+
+(defvar org-linear-oauth-pkce-verifier nil
+  "PKCE code verifier for OAuth flow.")
+
+;;;; Authentication helpers
+
+(defcustom org-linear-auth-host "api.linear.app"
+  "Host for Linear API authentication storage."
+  :type 'string
+  :group 'org-linear-auth)
+
+(defcustom org-linear-auth-user "token"
+  "User identifier for Linear token storage."
+  :type 'string
+  :group 'org-linear-auth)
+
+(defvar org-linear--cached-token nil
+  "Cached access token to avoid repeated auth-source lookups.")
+
+(defvar org-linear--token-expiry nil
+  "Timestamp when cached token expires.")
+
+(defun org-linear-auth--read-token ()
+  "Read Linear access token from auth-source with caching.
+Returns token string or nil if not found."
+  ;; Return cached token if still valid
+  (when (and org-linear--cached-token 
+             org-linear--token-expiry
+             (time-less-p (current-time) org-linear--token-expiry))
+    (return org-linear--cached-token))
+  
+  ;; Look up token from auth-source
+  (when-let* ((auth-info (auth-source-search
+                         :host org-linear-auth-host
+                         :user org-linear-auth-user
+                         :port "https"
+                         :require '(:secret)
+                         :max 1))
+              (auth-entry (car auth-info))
+              (secret-fn (plist-get auth-entry :secret)))
+    (let ((token (if (functionp secret-fn) (funcall secret-fn) secret-fn)))
+      (when (and token (stringp token) (> (length (string-trim token)) 0))
+        (setq org-linear--cached-token token
+              org-linear--token-expiry (time-add (current-time) (* 3600 24))) ; Cache for 24h
+        token))))
+
+(defun org-linear-auth--write-token (token &optional refresh-token expires-in)
+  "Write TOKEN to auth-source storage.
+REFRESH-TOKEN and EXPIRES-IN are stored for future use."
+  (when (and token (stringp token) (> (length (string-trim token)) 0))
+    (let ((auth-source-save-behavior t))
+      ;; Store access token
+      (auth-source-store-save
+       :host org-linear-auth-host
+       :user org-linear-auth-user
+       :port "https"
+       :secret token)
+      
+      ;; Store refresh token if provided
+      (when (and refresh-token (stringp refresh-token) (> (length (string-trim refresh-token)) 0))
+        (auth-source-store-save
+         :host org-linear-auth-host
+         :user (concat org-linear-auth-user "-refresh")
+         :port "https"
+         :secret refresh-token))
+      
+      ;; Cache the token
+      (setq org-linear--cached-token token
+            org-linear--token-expiry (if expires-in
+                                    (time-add (current-time) expires-in)
+                                  (time-add (current-time) (* 3600 24)))))))
+
+(defun org-linear-auth-clear ()
+  "Clear stored Linear authentication tokens."
+  (interactive)
+  (setq org-linear--cached-token nil
+        org-linear--token-expiry nil)
+  (let ((deleted 0))
+    ;; Clear access token
+    (when-let ((auth-info (auth-source-search
+                          :host org-linear-auth-host
+                          :user org-linear-auth-user
+                          :port "https"
+                          :max 1)))
+      (dolist (entry auth-info)
+        (when-let ((delete-fn (plist-get entry :delete)))
+          (funcall delete-fn)
+          (cl-incf deleted))))
+    
+    ;; Clear refresh token
+    (when-let ((auth-info (auth-source-search
+                          :host org-linear-auth-host
+                          :user (concat org-linear-auth-user "-refresh")
+                          :port "https"
+                          :max 1)))
+      (dolist (entry auth-info)
+        (when-let ((delete-fn (plist-get entry :delete)))
+          (funcall delete-fn)
+          (cl-incf deleted))))
+    
+    (message "Cleared %d Linear auth token(s)" deleted)))
+
+(defun org-linear-auth--read-client-credentials ()
+  "Read client credentials from environment or auth-source.
+Returns (client-id . client-secret) or signals error."
+  (let ((id (or (getenv "LINEAR_CLIENT_ID")
+                ;; Fallback to deprecated defcustom for backward compatibility
+                (unless (string-empty-p (string-trim org-linear-client-id))
+                  org-linear-client-id)
+                (when-let* ((auth-info (auth-source-search
+                                       :host org-linear-auth-host
+                                       :user "client-id"
+                                       :port "https"
+                                       :max 1))
+                            (secret-fn (plist-get (car auth-info) :secret)))
+                  (if (functionp secret-fn) (funcall secret-fn) secret-fn))))
+        (secret (or (getenv "LINEAR_CLIENT_SECRET")
+                    ;; Fallback to deprecated defcustom for backward compatibility
+                    (unless (string-empty-p (string-trim org-linear-client-secret))
+                      org-linear-client-secret)
+                    (when-let* ((auth-info (auth-source-search
+                                           :host org-linear-auth-host
+                                           :user "client-secret"
+                                           :port "https"
+                                           :max 1))
+                                (secret-fn (plist-get (car auth-info) :secret)))
+                      (if (functionp secret-fn) (funcall secret-fn) secret-fn)))))
+    (unless (and id secret 
+                 (> (length (string-trim id)) 0) 
+                 (> (length (string-trim secret)) 0))
+      (user-error "Linear client credentials not found. Set LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET environment variables, configure via auth-source, or set org-linear-client-id/org-linear-client-secret (deprecated)"))
+    (cons (string-trim id) (string-trim secret))))
+
+(defun org-linear-auth--base64url-encode (data)
+  "Encode DATA as base64url (RFC 4648)."
+  (let ((b64 (base64-encode-string data t)))
+    (setq b64 (replace-regexp-in-string "\\+" "-" b64))
+    (setq b64 (replace-regexp-in-string "/" "_" b64))
+    (setq b64 (replace-regexp-in-string "=" "" b64))
+    b64))
+
+(defun org-linear-auth--generate-pkce-pair ()
+  "Generate PKCE code verifier and challenge."
+  (let* ((verifier-data (format "%s-%s-%s-%s" 
+                               (current-time-string)
+                               (emacs-pid)
+                               (random 1000000)
+                               (random 1000000)))
+         (verifier (org-linear-auth--base64url-encode verifier-data))
+         (challenge-data (secure-hash 'sha256 verifier nil nil 'binary))
+         (challenge (org-linear-auth--base64url-encode challenge-data)))
+    (cons verifier challenge)))
+
+(defun org-linear-auth--generate-state ()
+  "Generate cryptographically secure OAuth state parameter."
+  (let ((state-data (format "%s-%s-%s-%s"
+                           (current-time-string)
+                           (emacs-pid)
+                           (random 1000000)
+                           (random 1000000))))
+    (org-linear-auth--base64url-encode state-data)))
+
+(defun org-linear-auth-status ()
+  "Show current authentication status."
+  (interactive)
+  (let ((has-token (or (org-linear-auth--read-token)
+                       (unless (string-empty-p (string-trim org-linear-api-key))
+                         org-linear-api-key)))
+        (has-credentials (condition-case nil
+                            (org-linear-auth--read-client-credentials)
+                          (error nil))))
+    (message "Linear auth status: Token: %s, Credentials: %s"
+             (if has-token "✓" "✗")
+             (if has-credentials "✓" "✗"))))
 
 ;;;; OAuth: top-level servlet + helpers
 
 ;; Handler at: http://localhost:8080/callback
 (defservlet callback text/plain (path query)
   (let ((code  (cadr (assoc "code" query)))
-        (state (cadr (assoc "state" query))))
+        (state (cadr (assoc "state" query)))
+        (error-code (cadr (assoc "error" query))))
     (cond
+     (error-code
+      (insert (format "Authentication failed: %s" error-code)))
      ((not (and code state))
       (insert "Authentication failed: missing code/state."))
-     ((not (string= state linear-oauth-state))
-      (insert "Authentication failed: invalid state."))
+     ((not (string= state org-linear-oauth-state))
+      (insert "Authentication failed: invalid state (CSRF protection)."))
      (t
-      (linear-oauth-exchange-code code)
-      (insert "Authentication successful! You can close this window.")))))
+      (condition-case err
+          (progn
+            (org-linear-oauth-exchange-code code)
+            (insert "Authentication successful! You can close this window."))
+        (error
+         (insert (format "Authentication failed during token exchange: %s" (error-message-string err)))))))))
 
 ;;;###autoload
-(defun linear-oauth-callback-server ()
+(defun org-linear-oauth-callback-server ()
   "Start a local HTTP server for Linear OAuth at /callback."
   (interactive)
   (setq httpd-port 8080)
@@ -94,64 +280,88 @@
   (message "Listening for Linear OAuth callback at http://localhost:%d/callback" httpd-port))
 
 ;;;###autoload
-(defun linear-oauth-callback-server-stop ()
+(defun org-linear-oauth-callback-server-stop ()
   "Stop the local HTTP server used for Linear OAuth."
   (interactive)
   (httpd-stop)
   (message "Stopped OAuth callback server."))
 
 ;;;###autoload
-(defun linear-oauth-authorize ()
+(defun org-linear-oauth-authorize ()
   "Start the OAuth2 authorization process for Linear."
   (interactive)
-  (if (or (string-empty-p (string-trim (or linear-client-id "")))
-          (string-empty-p (string-trim (or linear-client-secret ""))))
-      (message "linear-client-id and linear-client-secret must be set")
-    (let* ((state (format "%06x" (random (expt 16 6))))
-           (url (format (concat "https://linear.app/oauth/authorize"
-                                "?client_id=%s"
-                                "&redirect_uri=%s"
-                                "&response_type=code"
-                                "&scope=read,write"
-                                "&state=%s")
-                        (url-hexify-string linear-client-id)
-                        (url-hexify-string linear-oauth-redirect-uri)
-                        (url-hexify-string state))))
-      (setq linear-oauth-state state)
-      (browse-url url)
-      (message "Opening browser for Linear OAuth… (Ensure callback server is running)"))))
+  (condition-case err
+      (pcase-let* ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials))
+                   (`(,verifier . ,challenge) (org-linear-auth--generate-pkce-pair))
+                   (state (org-linear-auth--generate-state))
+                   (url (format (concat "https://linear.app/oauth/authorize"
+                                        "?client_id=%s"
+                                        "&redirect_uri=%s"
+                                        "&response_type=code"
+                                        "&scope=read,write"
+                                        "&state=%s"
+                                        "&code_challenge=%s"
+                                        "&code_challenge_method=S256")
+                                (url-hexify-string client-id)
+                                (url-hexify-string org-linear-oauth-redirect-uri)
+                                (url-hexify-string state)
+                                (url-hexify-string challenge))))
+        (setq org-linear-oauth-state state
+              org-linear-oauth-pkce-verifier verifier)
+        (browse-url url)
+        (message "Opening browser for Linear OAuth… (Ensure callback server is running)"))
+    (error
+     (message "Failed to start OAuth flow: %s" (error-message-string err)))))
 
-(defun linear-oauth-exchange-code (code)
+(defun org-linear-oauth-exchange-code (code)
   "Exchange authorization CODE for an access token."
-  (request
-   "https://api.linear.app/oauth/token"
-   :type "POST"
-   :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
-   :data (format (concat "code=%s"
-                         "&redirect_uri=%s"
-                         "&client_id=%s"
-                         "&client_secret=%s"
-                         "&grant_type=authorization_code")
-                 (url-hexify-string code)
-                 (url-hexify-string linear-oauth-redirect-uri)
-                 (url-hexify-string linear-client-id)
-                 (url-hexify-string linear-client-secret))
-   :parser 'json-read
-   :success (cl-function
-             (lambda (&key data &allow-other-keys)
-               (let ((access-token (alist-get 'access_token data)))
-                 (setq linear-api-key (string-trim (or access-token "")))
-                 (message "Successfully authenticated with Linear!"))))
-   :error (cl-function
-           (lambda (&key error-thrown &allow-other-keys)
-             (message "Error exchanging code for token: %S" error-thrown)))))
+  (pcase-let ((`(,client-id . ,client-secret) (org-linear-auth--read-client-credentials)))
+    (request
+     "https://api.linear.app/oauth/token"
+     :type "POST"
+     :headers '(("Content-Type" . "application/x-www-form-urlencoded"))
+     :data (format (concat "code=%s"
+                          "&redirect_uri=%s"
+                          "&client_id=%s"
+                          "&client_secret=%s"
+                          "&grant_type=authorization_code"
+                          "&code_verifier=%s")
+                   (url-hexify-string code)
+                   (url-hexify-string org-linear-oauth-redirect-uri)
+                   (url-hexify-string client-id)
+                   (url-hexify-string client-secret)
+                   (url-hexify-string (or org-linear-oauth-pkce-verifier "")))
+     :parser 'json-read
+     :success (cl-function
+               (lambda (&key data &allow-other-keys)
+                 (let ((access-token (alist-get 'access_token data))
+                       (refresh-token (alist-get 'refresh_token data))
+                       (expires-in (alist-get 'expires_in data)))
+                   (org-linear-auth--write-token access-token refresh-token expires-in)
+                   (setq org-linear-oauth-state nil
+                         org-linear-oauth-pkce-verifier nil)
+                   (message "Successfully authenticated with Linear!"))))
+     :error (cl-function
+             (lambda (&key error-thrown response &allow-other-keys)
+               (let ((status (when response (request-response-status-code response)))
+                     (data (when response 
+                            (condition-case nil
+                                (with-current-buffer (request-response-buffer response)
+                                  (json-read-from-string (buffer-string)))
+                              (error nil)))))
+                 (message "Error exchanging code for token (HTTP %s): %S. Data: %S" 
+                         status error-thrown data)))))))
 
 ;;;; GraphQL core
 
 (defun org-linear--assert-auth ()
-  "Signal an error if no API key is present."
-  (when (string-empty-p (string-trim (or linear-api-key "")))
-    (user-error "No Linear API key found. Run `linear-oauth-authorize' or set `linear-api-key'")))
+  "Signal an error if no API key is present, return token if found."
+  (let ((token (or (org-linear-auth--read-token)
+                   (unless (string-empty-p (string-trim org-linear-api-key))
+                     org-linear-api-key))))
+    (unless (and token (> (length (string-trim token)) 0))
+      (user-error "No Linear API key found. Run `linear-oauth-authorize' or configure via auth-source"))
+    token))
 
 (defun org-linear--alist-get-in (keys alist)
   "Return nested value by KEYS from ALIST/hash-tables."
@@ -165,14 +375,14 @@
 (defun org-linear--graphql (query &optional variables)
   "Execute a synchronous GraphQL REQUEST with QUERY and VARIABLES.
 Returns parsed JSON as an alist, or signals an error with details."
-  (org-linear--assert-auth)
-  (let (resp err resp-buf)
+  (let ((token (org-linear--assert-auth))
+        resp err resp-buf)
     (request
-     linear-graphql-endpoint
+     org-linear-graphql-endpoint
      :type "POST"
      :sync t
      :headers `(("Content-Type" . "application/json")
-                ("Authorization" . ,(concat "Bearer " (string-trim linear-api-key))))
+                ("Authorization" . ,(concat "Bearer " (string-trim token))))
      :data (json-encode `(("query" . ,query)
                           ("variables" . ,(or variables (make-hash-table :test 'equal)))))
      :parser 'json-read
@@ -243,8 +453,8 @@ Returns parsed JSON as an alist, or signals an error with details."
          (data  (org-linear--graphql q vars))
          (nodes (alist-get 'nodes (alist-get 'users data))))
     (let* ((vec (append nodes nil))
-           (active (seq-filter (lambda (u) (linear--truthy (alist-get 'active u))) vec))
-           (inactive (seq-remove (lambda (u) (linear--truthy (alist-get 'active u))) vec))
+           (active (seq-filter (lambda (u) (org-linear--truthy (alist-get 'active u))) vec))
+           (inactive (seq-remove (lambda (u) (org-linear--truthy (alist-get 'active u))) vec))
            (ordered (append active inactive)))
       (mapcar (lambda (u)
                 (let* ((id (alist-get 'id u))
@@ -285,7 +495,7 @@ Returns parsed JSON as an alist, or signals an error with details."
         (cl-incf guard)
         (let* ((vars (let ((ht (make-hash-table :test 'equal)))
                        (puthash "teamId" team-id ht)
-                       (puthash "first" (or linear-issues-page-size 50) ht)
+                       (puthash "first" (or org-linear-issues-page-size 50) ht)
                        (when after (puthash "after" after ht))
                        ht))
                (data   (org-linear--graphql query vars))
@@ -570,7 +780,7 @@ Writes LINEAR_ID/URL/STATE/ASSIGNEE/PRIORITY back to PROPERTIES and prefixes hea
       (cl-incf guard)
       (let* ((vars (let ((ht (make-hash-table :test 'equal)))
                      (puthash "assigneeId" user-id ht)
-                     (puthash "first" (or linear-issues-page-size 50) ht)
+                     (puthash "first" (or org-linear-issues-page-size 50) ht)
                      (when after (puthash "after" after ht))
                      ht))
              (data (org-linear--graphql query vars))
